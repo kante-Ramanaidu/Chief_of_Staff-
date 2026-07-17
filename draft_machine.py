@@ -11,11 +11,12 @@ import time
 from typing import Dict, Any
 from dotenv import load_dotenv
 
+import streamlit as st
 from google import genai
 from google.genai import types
 from context_builder import build_reply_context
 
-# Load environment variables
+# Load environment variables (.env file for local development)
 load_dotenv()
 
 # Sample Threads for the Streamlit approval gate or testing
@@ -73,12 +74,35 @@ SAMPLE_THREADS = [
     }
 ]
 
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY not found in .env file")
+# ---------------------------------------------------------------------------
+# API key resolution — checked once at import time so the client is never
+# initialised with None (which produces a cryptic error inside google-genai).
+#
+# Priority:
+#   1. GEMINI_API_KEY environment variable  (local dev / .env file)
+#   2. st.secrets["GEMINI_API_KEY"]          (Streamlit Cloud deployment)
+#   3. Raise ValueError with clear instructions  (key missing from both)
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY") or ""
 
-# Initialize the client
+if not GEMINI_API_KEY:
+    # st.secrets is only available inside a running Streamlit process.
+    # When running from the CLI (e.g. python draft_machine.py) the call
+    # raises an exception, which we catch and ignore.
+    try:
+        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or ""
+    except Exception:
+        GEMINI_API_KEY = ""
+
+if not GEMINI_API_KEY:
+    raise ValueError(
+        "GEMINI_API_KEY is not set.\n\n"
+        "  Local development : add  GEMINI_API_KEY=<your_key>  to your .env file.\n"
+        "  Streamlit Cloud   : add  GEMINI_API_KEY = \"<your_key>\"  under "
+        "Settings → Secrets in the Streamlit Cloud dashboard.\n\n"
+        "Get a free key at https://aistudio.google.com/app/apikey"
+    )
+
 MODEL_NAME = "gemini-2.5-flash"
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -169,12 +193,9 @@ def draft_reply(thread: Dict[str, Any]) -> str:
     Returns:
         str: The generated draft text (no subject line, no explanation)
     """
-    if not GEMINI_API_KEY:
-        raise ValueError(
-            "GEMINI_API_KEY not found. Please set it in your .env file.\n"
-            "Create a .env file with: GEMINI_API_KEY=your_key_here"
-        )
-    
+    # GEMINI_API_KEY is validated at module import time — if execution
+    # reaches here the key is present and `client` is already initialised.
+
     # Get the base context from context_builder
     base_context = build_reply_context(thread)
     
