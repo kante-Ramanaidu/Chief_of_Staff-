@@ -1,0 +1,57 @@
+[
+    {
+        "id": "thread_prod_issue",
+        "subject": "URGENT: Production database latency spikes",
+        "messages": [
+            {
+                "from": "devops-alerts@company.com",
+                "date": "2026-07-10 14:05:00",
+                "body": "Alert: Production Database CPU usage has exceeded 95% and latency is spiking. Customers are reporting HTTP 504 gateway timeouts. We need a DBA to check active connections and kill long-running queries immediately."
+            }
+        ]
+    },
+    {
+        "id": "thread_q3_feedback",
+        "subject": "Q3 Planning & Feedback Request",
+        "messages": [
+            {
+                "from": "boss@company.com",
+                "date": "2026-07-10 10:15:00",
+                "body": "Hi team, we are finalizing the Q3 roadmap slides by Monday. Please review the shared deck and reply with your top 3 pieces of feedback/commitments by end of day today so we can incorporate them."
+            }
+        ]
+    },
+    {
+        "id": "thread_weekly_standup",
+        "subject": "Weekly Standup Notes - FYI Only",
+        "messages": [
+            {
+                "from": "scrum-master@company.com",
+                "date": "2026-07-10 09:00:00",
+                "body": "Hi all, here are the notes and action items from this morning's weekly sync. All key milestones are on track. No response or meeting is required this week. Have a great weekend!"
+            }
+        ]
+    },
+    {
+        "id": "thread_vendor_contract",
+        "subject": "Follow-up: Updated Vendor Service Agreement",
+        "messages": [
+            {
+                "from": "sales@saas-provider.com",
+                "date": "2026-07-09 16:30:00",
+                "body": "Hi there, I am following up on the service agreement we sent last week. We have incorporated your legal team's feedback regarding SLA credits on page 4. Can you review and let us know if you are ready for sign-off?"
+            }
+        ]
+    },
+    {
+        "id": "thread_design_review",
+        "subject": "Design Review: Main Dashboard Redesign",
+        "messages": [
+            {
+                "from": "designer@company.com",
+                "date": "2026-07-09 11:00:00",
+                "body": "Hi team, the Figma wireframes for the new dashboard redesign are complete. I would love to schedule a 30-minute review session next Tuesday. Are you available either at 11 AM or 2 PM EST?"
+            }
+        ]
+    }
+]

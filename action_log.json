@@ -1,0 +1,16 @@
+[
+  {
+    "timestamp": "2026-07-17T14:16:09.898340+00:00",
+    "action_type": "booked",
+    "thread_subject": "",
+    "detail": "",
+    "id": "ssdn5p3kiac73ek5ni2kl41g6c"
+  },
+  {
+    "timestamp": "2026-07-17T14:45:39.460849+00:00",
+    "action_type": "booked",
+    "thread_subject": "Let's discuss about deployment",
+    "detail": "Final discussion",
+    "id": "fes9h8t3q08np1m0tsf62duh90"
+  }
+]

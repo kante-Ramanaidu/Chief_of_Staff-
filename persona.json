@@ -1,0 +1,15 @@
+{
+  "name": "Ram",
+  "role": "",
+  "company": "",
+  "tone": "professional but warm",
+  "formality": "semi-formal (not stiff, not casual)",
+  "sentence_length": "short to medium, gets to the point",
+  "greeting_style": "Hi [Name],",
+  "sign_off": "Thanks, Ram",
+  "quirks": [
+    "Never uses 'I hope this email finds you well'",
+    "Keeps replies under 5 sentences when possible",
+    "Gets to the point quickly, minimal small talk"
+  ]
+}
