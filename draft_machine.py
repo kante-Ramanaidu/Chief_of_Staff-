@@ -75,13 +75,16 @@ SAMPLE_THREADS = [
 ]
 
 # ---------------------------------------------------------------------------
-# API key resolution — checked once at import time so the client is never
-# initialised with None (which produces a cryptic error inside google-genai).
+# API key resolution
 #
 # Priority:
 #   1. GEMINI_API_KEY environment variable  (local dev / .env file)
 #   2. st.secrets["GEMINI_API_KEY"]          (Streamlit Cloud deployment)
-#   3. Raise ValueError with clear instructions  (key missing from both)
+#   3. Leave as None — app.py will set it at runtime via the sidebar input,
+#      and draft_reply() will raise a clear error if called without a key.
+#
+# NOTE: never raise at module import time — that crashes the entire Streamlit
+# app before the UI loads, preventing the user from entering a key.
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -91,17 +94,8 @@ if not GEMINI_API_KEY:
     except (KeyError, FileNotFoundError):
         GEMINI_API_KEY = None
 
-if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is not set.\n\n"
-        "  Local development : add  GEMINI_API_KEY=<your_key>  to your .env file.\n"
-        "  Streamlit Cloud   : add  GEMINI_API_KEY = \"<your_key>\"  under "
-        "Settings → Secrets in the Streamlit Cloud dashboard.\n\n"
-        "Get a free key at https://aistudio.google.com/app/apikey"
-    )
-
 MODEL_NAME = "gemini-2.5-flash"
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +184,14 @@ def draft_reply(thread: Dict[str, Any]) -> str:
     Returns:
         str: The generated draft text (no subject line, no explanation)
     """
-    # GEMINI_API_KEY is validated at module import time — if execution
-    # reaches here the key is present and `client` is already initialised.
+    if not GEMINI_API_KEY:
+        raise ValueError(
+            "GEMINI_API_KEY is not set.\n\n"
+            "  Local development : add  GEMINI_API_KEY=<your_key>  to your .env file.\n"
+            "  Streamlit Cloud   : add  GEMINI_API_KEY = \"<your_key>\"  under "
+            "Settings → Secrets in the Streamlit Cloud dashboard.\n\n"
+            "Get a free key at https://aistudio.google.com/app/apikey"
+        )
 
     # Get the base context from context_builder
     base_context = build_reply_context(thread)
