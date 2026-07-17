@@ -83,16 +83,13 @@ SAMPLE_THREADS = [
 #   2. st.secrets["GEMINI_API_KEY"]          (Streamlit Cloud deployment)
 #   3. Raise ValueError with clear instructions  (key missing from both)
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY") or ""
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    # st.secrets is only available inside a running Streamlit process.
-    # When running from the CLI (e.g. python draft_machine.py) the call
-    # raises an exception, which we catch and ignore.
     try:
-        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or ""
-    except Exception:
-        GEMINI_API_KEY = ""
+        GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        GEMINI_API_KEY = None
 
 if not GEMINI_API_KEY:
     raise ValueError(
