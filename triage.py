@@ -2,12 +2,21 @@ import os
 import json
 import time
 import hashlib
+import streamlit as st
 import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# Read key from env (local .env) or Streamlit Secrets (Cloud deployment)
+_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not _GEMINI_API_KEY:
+    try:
+        _GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        _GEMINI_API_KEY = None
+
+genai.configure(api_key=_GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 

@@ -244,23 +244,20 @@ if st.sidebar.button(
     st.rerun()
 st.sidebar.caption("Fetches, triages, and drafts — stops at Approval Gate.")
 
-# API Key Resolution
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
-    if api_key_input:
-        api_key = api_key_input
-        os.environ["GEMINI_API_KEY"] = api_key
-        draft_machine.GEMINI_API_KEY = api_key
-        draft_machine.client = genai.Client(api_key=api_key)
-        # Also configure the legacy gemini configuration if triage.py uses it
-        import google.generativeai as legacy_genai
-        legacy_genai.configure(api_key=api_key)
-else:
-    draft_machine.GEMINI_API_KEY = api_key
-    draft_machine.client = genai.Client(api_key=api_key)
+# API key — read from environment (local .env) or Streamlit Secrets (Cloud deployment).
+# Never entered via the UI; set GEMINI_API_KEY in Streamlit → Settings → Secrets.
+_api_key = os.getenv("GEMINI_API_KEY")
+if not _api_key:
+    try:
+        _api_key = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        _api_key = None
+
+if _api_key:
     import google.generativeai as legacy_genai
-    legacy_genai.configure(api_key=api_key)
+    legacy_genai.configure(api_key=_api_key)
+    draft_machine.GEMINI_API_KEY = _api_key
+    draft_machine.client = genai.Client(api_key=_api_key)
 
 # Source selector
 # Determine the default index from session state so the widget reflects
@@ -817,33 +814,30 @@ elif st.session_state.current_phase == "Draft Generation":
                             
                         # Generate Draft button
                         if st.button("✨ Generate / Regenerate Reply", key=f"gen_{tid}", use_container_width=True):
-                            if not api_key:
-                                st.error("Gemini API Key required!")
-                            else:
-                                with st.spinner("Drafting with Gemini..."):
-                                    try:
-                                        # Format the input thread to match draft_machine's expectations
-                                        # (thread_id, sender, subject, snippet, date, priority, category, reason)
-                                        compat_thread = {
-                                            "thread_id": tid,
-                                            "sender": first_msg.get("from", ""),
-                                            "subject": t.get("subject", ""),
-                                            "snippet": first_msg.get("body", ""),
-                                            "date": first_msg.get("date", ""),
-                                            "priority": t.get("priority", "needs reply"),
-                                            "category": t.get("category", "project"),
-                                            "reason": t.get("reason", "")
-                                        }
-                                        
-                                        draft_text = draft_machine.draft_reply(compat_thread)
-                                        st.session_state.drafts[tid] = draft_text
-                                        # Remove from rejected set if regenerated
-                                        if tid in st.session_state.rejected:
-                                            st.session_state.rejected.remove(tid)
-                                        st.success("Draft created!")
-                                        st.rerun()
-                                    except Exception as e:
-                                        _show_gemini_error(e)
+                            with st.spinner("Drafting with Gemini..."):
+                                try:
+                                    # Format the input thread to match draft_machine's expectations
+                                    # (thread_id, sender, subject, snippet, date, priority, category, reason)
+                                    compat_thread = {
+                                        "thread_id": tid,
+                                        "sender": first_msg.get("from", ""),
+                                        "subject": t.get("subject", ""),
+                                        "snippet": first_msg.get("body", ""),
+                                        "date": first_msg.get("date", ""),
+                                        "priority": t.get("priority", "needs reply"),
+                                        "category": t.get("category", "project"),
+                                        "reason": t.get("reason", "")
+                                    }
+                                    
+                                    draft_text = draft_machine.draft_reply(compat_thread)
+                                    st.session_state.drafts[tid] = draft_text
+                                    # Remove from rejected set if regenerated
+                                    if tid in st.session_state.rejected:
+                                        st.session_state.rejected.remove(tid)
+                                    st.success("Draft created!")
+                                    st.rerun()
+                                except Exception as e:
+                                    _show_gemini_error(e)
                                         
                     # Display existing draft
                     if tid in st.session_state.drafts:
