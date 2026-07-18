@@ -1,80 +1,107 @@
 """
 task_logger.py
---------------
-Lightweight action log backed by action_log.json in the project root.
+==============
+Lightweight append-only action log for the Chief of Staff workflow.
 
-Records every sent email and booked calendar event so the app can display
-a history of what the assistant has done.
+Records every "sent" and "booked" action to ``action_log.json`` in the
+same directory as this file.  No third-party dependencies — only the
+Python standard library.
 
-Log file location: action_log.json  (same directory as this module)
+Public API
+----------
+- ``log_action(action_type, thread_subject, detail, action_id)``  -> dict
+- ``get_action_log()``                                             -> list[dict]
+- ``clear_log()``                                                  -> None
 """
+from __future__ import annotations
 
 import json
 import os
 from datetime import datetime, timezone
+from typing import Any
 
-# Resolve the log file path relative to this module, not the cwd.
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "action_log.json")
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-_VALID_ACTION_TYPES = {"sent", "booked"}
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(_HERE, "action_log.json")
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def log_action(
     action_type: str,
     thread_subject: str,
     detail: str,
     action_id: str,
-) -> dict:
-    """Append one record to action_log.json and return the record.
+) -> dict[str, Any]:
+    """Append one action record to ``action_log.json``.
 
     Parameters
     ----------
-    action_type   : "sent"   – an email was sent (detail = recipient address)
-                    "booked" – a meeting was created (detail = meeting title)
-    thread_subject: subject line of the originating email thread
-    detail        : recipient email  (action_type == "sent")
-                    meeting title    (action_type == "booked")
-    action_id     : Gmail message_id or Google Calendar event_id
-    """
-    if action_type not in _VALID_ACTION_TYPES:
-        raise ValueError(
-            f"action_type must be one of {_VALID_ACTION_TYPES!r}, got {action_type!r}"
-        )
+    action_type : str
+        Either ``"sent"`` or ``"booked"``.
+    thread_subject : str
+        Subject line of the email thread the action relates to.
+    detail : str
+        Human-readable detail: recipient email for ``"sent"`` actions,
+        meeting title for ``"booked"`` actions.
+    action_id : str
+        Unique identifier: Gmail ``message_id`` for ``"sent"`` actions,
+        Google Calendar ``event_id`` for ``"booked"`` actions.
 
-    record = {
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
-        "action_type":    action_type,
+    Returns
+    -------
+    dict
+        The record that was appended, including the generated timestamp
+        and all provided fields.
+    """
+    record: dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action_type": action_type,
         "thread_subject": thread_subject,
-        "detail":         detail,
-        "id":             action_id,
+        "detail": detail,
+        "id": action_id,
     }
 
-    entries = get_action_log()
-    entries.append(record)
+    existing = get_action_log()
+    existing.append(record)
 
-    with open(_LOG_PATH, "w", encoding="utf-8") as fh:
-        json.dump(entries, fh, indent=2, ensure_ascii=False)
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
 
     return record
 
 
-def get_action_log() -> list:
-    """Return the full list of logged actions.
+def get_action_log() -> list[dict[str, Any]]:
+    """Return all records from ``action_log.json``.
 
-    Returns [] if action_log.json does not exist, is empty, or is malformed.
+    Returns
+    -------
+    list[dict]
+        The full log in append order, or ``[]`` if the file does not
+        exist, is empty, or contains invalid JSON.
     """
-    if not os.path.exists(_LOG_PATH):
+    if not os.path.exists(LOG_PATH):
         return []
 
     try:
-        with open(_LOG_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, list) else []
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
     except (json.JSONDecodeError, OSError):
         return []
 
 
 def clear_log() -> None:
-    """Overwrite action_log.json with an empty list."""
-    with open(_LOG_PATH, "w", encoding="utf-8") as fh:
-        json.dump([], fh, indent=2)
+    """Overwrite ``action_log.json`` with an empty list.
+
+    Creates the file if it does not exist.
+    """
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump([], f)

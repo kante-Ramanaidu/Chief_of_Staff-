@@ -1,543 +1,541 @@
 """
-Calendar engine module for reading and writing Google Calendar events.
-Uses the same OAuth credentials as engine.py (credentials.json / token.json).
+calendar_engine.py
+==================
+Chief-of-Staff Google Calendar engine.
+
+Provides ``_build_calendar_service()`` which returns an authenticated
+``googleapiclient`` Resource for the Calendar v3 API.
+
+OAuth credentials are shared with ``engine.py``:
+  - ``credentials.json``  — OAuth desktop-client secrets
+  - ``token.json``        — cached access/refresh token (auto-created)
+
+The same three scopes used by engine.py are requested so that a single
+token.json covers both Gmail and Calendar operations:
+  - https://www.googleapis.com/auth/gmail.readonly
+  - https://www.googleapis.com/auth/gmail.send
+  - https://www.googleapis.com/auth/calendar
 """
+from __future__ import annotations
 
-import os
-import re
-import json
 import socket
-import time
-import traceback
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from google import genai
-from google.genai import types
 
 # ---------------------------------------------------------------------------
-# IPv4 monkey-patch
-# Forces the Google API client to prefer IPv4 on networks where IPv6
-# connectivity causes slow or failed connections.
+# IPv4 monkey-patch (mirrors engine.py)
+# Prevents hangs on hosts that advertise IPv6 but can't complete the
+# connection — forces all DNS resolution to return IPv4 addresses only.
 # ---------------------------------------------------------------------------
 _original_getaddrinfo = socket.getaddrinfo
 
 
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _original_getaddrinfo(
+        host,
+        port,
+        socket.AF_INET,  # Force IPv4
+        type,
+        proto,
+        flags,
+    )
 
 
-socket.getaddrinfo = _ipv4_getaddrinfo
+socket.getaddrinfo = ipv4_only_getaddrinfo
+
+import os
+from typing import Any
 
 # ---------------------------------------------------------------------------
-# OAuth configuration — shared with engine.py
-# All three scopes must be present in token.json.  If token.json was
-# created before the calendar scope was added, delete it and re-auth.
+# Config
 # ---------------------------------------------------------------------------
-SCOPES = [
+
+# Scopes must match engine.py exactly so both modules share the same
+# token.json without triggering a re-auth flow.
+_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
 ]
 
-CREDENTIALS_PATH = "credentials.json"
-TOKEN_PATH = "token.json"
-
-# IST timezone constant — used as the default local timezone for naive datetimes
-_IST = timezone(timedelta(hours=5, minutes=30), "IST")
-
 
 # ---------------------------------------------------------------------------
-# Auth helpers
+# Calendar service builder
 # ---------------------------------------------------------------------------
-
-def _check_token_has_calendar_scope() -> bool:
-    """
-    Return True if the stored token.json grants the calendar scope.
-    Returns False (does not raise) if the file is missing or unparseable.
-    """
-    if not os.path.exists(TOKEN_PATH):
-        return False
-    try:
-        with open(TOKEN_PATH, "r") as f:
-            data = json.load(f)
-        scopes_in_token = data.get("scopes", [])
-        return any("calendar" in s for s in scopes_in_token)
-    except Exception:
-        return False
-
 
 def _build_calendar_service():
-    """
-    Return an authenticated Google Calendar v3 service object.
+    """Return an authenticated Google Calendar v3 service resource.
 
-    Shares credentials.json and token.json with engine.py.
-    Raises RuntimeError with a clear message if the stored token lacks the
-    calendar scope — prompting the user to delete token.json and re-auth.
-    """
-    # Warn early if the existing token is missing the calendar scope
-    if os.path.exists(TOKEN_PATH) and not _check_token_has_calendar_scope():
-        raise RuntimeError(
-            "token.json does not contain the calendar scope. "
-            "Please delete token.json and restart the app to re-authenticate "
-            "with all required permissions (gmail.readonly, gmail.send, calendar)."
-        )
+    Follows the same OAuth flow as ``engine._build_gmail_service()``:
 
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    1. Load an existing token from ``token.json`` if present.
+    2. Refresh it silently if expired and a refresh token is available.
+    3. Run the local OAuth flow (browser popup) if no valid token exists,
+       then persist the new token back to ``token.json``.
+    4. Build and return the Calendar v3 service.
+
+    The ``credentials.json`` and ``token.json`` files are resolved relative
+    to this file's directory — the same location engine.py uses — so both
+    modules share a single set of credential files.
+
+    Returns
+    -------
+    googleapiclient.discovery.Resource
+        Authenticated Calendar v3 service.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``credentials.json`` is missing and no valid ``token.json``
+        exists to skip the OAuth flow.
+    """
+    from google.auth.transport.requests import Request  # type: ignore
+    from google.oauth2.credentials import Credentials  # type: ignore
+    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    creds_path = os.path.join(here, "credentials.json")
+    token_path = os.path.join(here, "token.json")
+
+    print(f"[DEBUG] credentials path = {creds_path}")
+    print(f"[DEBUG] token path       = {token_path}")
+
+    creds: Credentials | None = None
+
+    if os.path.exists(token_path):
+        print("[DEBUG] token.json exists")
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, _SCOPES)
+            print("[DEBUG] loaded token.json")
+        except ValueError as e:
+            print(f"[DEBUG] token invalid: {e}")
+            creds = None
 
     if not creds or not creds.valid:
+        print("[DEBUG] need authentication")
+
         if creds and creds.expired and creds.refresh_token:
+            print("[DEBUG] refreshing token")
             creds.refresh(Request())
+            print("[DEBUG] token refreshed")
+
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+            print("[DEBUG] starting OAuth flow")
 
-        with open(TOKEN_PATH, "w") as token_file:
-            token_file.write(creds.to_json())
+            if not os.path.exists(creds_path):
+                raise FileNotFoundError(
+                    f"Google OAuth client secrets not found at {creds_path}"
+                )
 
-    return build("calendar", "v3", credentials=creds)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                creds_path,
+                _SCOPES,
+            )
+
+            creds = flow.run_local_server(
+                host="localhost",
+                port=8080,
+                open_browser=True,
+            )
+
+            print("[DEBUG] OAuth completed")
+
+        print("[DEBUG] writing token.json")
+
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+        print("[DEBUG] token.json written")
+
+    print("[DEBUG] building Calendar service")
+
+    service = build(
+        "calendar",
+        "v3",
+        credentials=creds,
+        cache_discovery=False,
+    )
+
+    print("[DEBUG] Calendar service built")
+
+    return service
+
+# ---------------------------------------------------------------------------
+# Environment / API key
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+from dotenv import load_dotenv  # type: ignore
+
+# Mirror draft_machine.py: try the project directory first, then CWD.
+_HERE = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=_HERE / ".env")
+load_dotenv()
+
+_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Regex for stripping markdown code fences (```json … ``` or ``` … ```)
+import re
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9]*\n?|```$", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
-# Timezone conversion helper
+# Meeting-request parser
 # ---------------------------------------------------------------------------
 
-def _to_utc_rfc3339(dt_str: str, local_tz: timezone = _IST) -> str:
+def parse_meeting_request(thread: dict[str, Any]) -> dict[str, Any]:
+    """Use Gemini to extract meeting details from an email thread.
+
+    Concatenates all messages in ``thread["messages"]`` into a single
+    plain-text block, then asks Gemini (gemini-2.5-flash) to return a
+    JSON object with the following keys:
+
+    - ``proposed_times``    : list[str]  — ISO-8601 datetime strings
+                              (e.g. ``"2026-06-25T14:00:00"``)
+    - ``attendees``         : list[str]  — email addresses of all
+                              participants mentioned
+    - ``topic``             : str        — one-line meeting summary
+    - ``duration_minutes``  : int        — meeting length; default 30 if
+                              not specified in the thread
+
+    Today's date is injected into the prompt so Gemini can resolve
+    relative day names ("this Friday", "next Monday", etc.) correctly.
+
+    Parameters
+    ----------
+    thread : dict
+        Thread dict with ``subject`` and ``messages``.  Each message
+        should have ``from``, ``date``, and ``body`` keys.
+
+    Returns
+    -------
+    dict
+        Parsed meeting details, or ``{"parsing_error": str}`` if anything
+        goes wrong (missing API key, Gemini error, JSON parse failure).
+        The function never raises.
     """
-    Convert an ISO-8601 datetime string to a UTC RFC 3339 string (ending in Z).
+    import json as _json
+    from datetime import date
 
-    Rules:
-    - Ends with "Z"        → already UTC, normalise and return.
-    - Has explicit offset  → parse with fromisoformat, convert to UTC.
-    - Naive (no tz info)   → treat as local_tz, convert to UTC.
-    - Date-only string     → treat as midnight in local_tz, convert to UTC.
+    # --- 1. Build the raw thread text ----------------------------------------
+    subject = thread.get("subject", "(no subject)")
+    messages = thread.get("messages") or []
 
-    Raises ValueError for unparseable input so callers can skip gracefully.
-    """
-    clean = dt_str.strip()
+    thread_lines: list[str] = [f"Subject: {subject}", ""]
+    for i, msg in enumerate(messages, start=1):
+        thread_lines.append(f"[Message {i}]")
+        thread_lines.append(f"From: {msg.get('from', '?')}")
+        thread_lines.append(f"Date: {msg.get('date', '?')}")
+        thread_lines.append("")
+        thread_lines.append((msg.get("body") or "").strip())
+        thread_lines.append("")
 
-    if clean.endswith("Z"):
-        # Already UTC
-        utc_dt = datetime.fromisoformat(clean[:-1]).replace(tzinfo=timezone.utc)
-        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    thread_text = "\n".join(thread_lines).strip()
 
-    # Detect explicit UTC offset (+hh:mm or -hh:mm after the time portion)
-    has_explicit_offset = False
-    if "T" in clean:
-        time_part = clean.split("T", 1)[1]
-        # "+" anywhere after T, or a "-" that isn't part of the time digits
-        if "+" in time_part or re.search(r"-\d{2}:\d{2}$", time_part):
-            has_explicit_offset = True
-
-    if has_explicit_offset:
-        aware_dt = datetime.fromisoformat(clean)
-        utc_dt = aware_dt.astimezone(timezone.utc)
-    else:
-        # Naive — may be date-only ("2026-07-15") or datetime ("2026-07-15T14:00:00")
-        if "T" not in clean:
-            # Date-only: treat as midnight local time
-            naive = datetime.fromisoformat(clean + "T00:00:00")
-        else:
-            naive = datetime.fromisoformat(clean)
-        local_dt = naive.replace(tzinfo=local_tz)
-        utc_dt = local_dt.astimezone(timezone.utc)
-        print(
-            f"[_to_utc_rfc3339] naive '{clean}' → "
-            f"{local_tz} → UTC {utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-        )
-
-    return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# ---------------------------------------------------------------------------
-# Meeting request parser
-# ---------------------------------------------------------------------------
-
-# Errors that are worth retrying (transient / rate-limit / server-side)
-_TRANSIENT_ERROR_FRAGMENTS = (
-    "503", "500", "UNAVAILABLE", "overloaded", "quota", "rate",
-    "ServiceUnavailable", "InternalServerError",
-)
-
-
-def _is_transient(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(fragment.lower() in msg for fragment in _TRANSIENT_ERROR_FRAGMENTS)
-
-
-def _friendly_gemini_error(exc: Exception) -> str:
-    """
-    Return a short user-facing message for a Gemini API exception.
-    Full exception details are always printed to the console by the caller.
-    """
-    msg = str(exc).lower()
-    if "503" in msg or "unavailable" in msg or "overloaded" in msg or "high demand" in msg:
-        return (
-            "⏳ Gemini is temporarily busy (free tier). "
-            "Please wait a moment and try again."
-        )
-    if "429" in msg or "resource_exhausted" in msg or "quota" in msg or "rate" in msg:
-        return (
-            "⚠️ Daily free-tier quota reached for Gemini. "
-            "Please wait for it to reset, or upgrade your plan to continue."
-        )
-    return "Something went wrong with Gemini. Please try again."
-
-
-def _extract_emails_from_thread(thread: Dict[str, Any]) -> List[str]:
-    """
-    Pull real email addresses from the thread's message From/To/Cc headers
-    so we never rely on Gemini guessing addresses from body text.
-
-    Returns a de-duplicated list of email strings, preserving insertion order.
-    """
-    seen: dict = {}  # use dict for ordered dedup
-    for msg in thread.get("messages", []):
-        for field in ("from", "to", "cc"):
-            raw = msg.get(field, "")
-            if not raw:
-                continue
-            # Extract all <email> patterns, then fall back to bare addresses
-            found = re.findall(r"<([^>]+)>", raw)
-            if not found:
-                # bare "email@domain" with no angle brackets
-                for part in raw.split(","):
-                    part = part.strip()
-                    if "@" in part:
-                        found.append(part)
-            for addr in found:
-                addr = addr.strip().lower()
-                if "@" in addr:
-                    seen[addr] = None
-    return list(seen.keys())
-
-
-def parse_meeting_request(thread: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Use Gemini (gemini-2.5-flash) to extract meeting details from an email thread.
-
-    Returns a dict with keys:
-        proposed_times   – list of ISO-8601 datetime strings (local/naive)
-        attendees        – list of verified email address strings
-        topic            – one-line meeting summary
-        duration_minutes – int (default 30)
-
-    On unrecoverable failure returns {"parsing_error": "<description>"}.
-    Retries up to 3 times (2 s / 4 s / 8 s) for transient errors only.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return {"parsing_error": "GEMINI_API_KEY not set in environment"}
-
-    # --- Build transcript ---
-    transcript_parts = []
-    for msg in thread.get("messages", []):
-        header = f"From: {msg.get('from', 'unknown')}\nDate: {msg.get('date', 'unknown')}"
-        # Include To/Cc so Gemini sees all participants in context
-        if msg.get("to"):
-            header += f"\nTo: {msg['to']}"
-        if msg.get("cc"):
-            header += f"\nCc: {msg['cc']}"
-        body = msg.get("body", "").strip()
-        transcript_parts.append(f"{header}\n\n{body}")
-    transcript = "\n\n---\n\n".join(transcript_parts)
-
-    today = date.today().isoformat()
+    # --- 2. Build the prompt -------------------------------------------------
+    today_str = date.today().isoformat()  # e.g. "2026-06-22"
 
     system_instruction = (
         "You are a scheduling assistant. "
-        "Extract meeting details from the email thread and return ONLY a single "
-        "valid JSON object — not a list or array, not wrapped in markdown, "
-        "no code fences, no commentary, no text before or after. "
-        "The response MUST start with '{' and end with '}'. "
-        "The object must have exactly these four keys:\n"
-        '  "proposed_times"   – array of ISO-8601 datetime strings '
-        '(e.g. ["2026-07-15T14:00:00"]).  Use the date shown in the email headers '
-        "to resolve relative day names like 'Tuesday' or 'tomorrow'.\n"
-        '  "attendees"        – array of email address strings extracted ONLY from '
-        "the From/To/Cc header lines in the transcript, never from the body or "
-        "signature. If no email addresses appear in the headers, return [].\n"
-        '  "topic"            – string, one-line summary of the meeting purpose.\n'
-        '  "duration_minutes" – integer, meeting length in minutes. '
-        "Default 30 if not stated.\n"
-        "If a field cannot be determined, use [] for arrays, "
-        '"" for topic, 30 for duration_minutes. '
-        "Do NOT wrap the object in an outer array."
+        "Extract meeting details from the email thread provided by the user. "
+        "Return ONLY a valid JSON object — no prose, no markdown, no code fences. "
+        "The JSON must have exactly these keys:\n"
+        '  "proposed_times"   : array of ISO-8601 datetime strings '
+        '(e.g. ["2026-06-25T14:00:00"]). Empty array if none found.\n'
+        '  "attendees"        : array of email address strings. '
+        "Include all senders and any addresses mentioned in the body.\n"
+        '  "topic"            : one-line string summarising the meeting purpose.\n'
+        '  "duration_minutes" : integer number of minutes. Default to 30 if not '
+        "explicitly stated.\n"
+        "Do not include any other keys or explanation."
     )
 
     user_prompt = (
-        f"Today's date is {today}. "
-        "Resolve any relative day names (e.g. 'tomorrow', 'Tuesday') "
-        "relative to this date.\n\n"
-        f"Email thread:\n\n{transcript}"
+        f"Today's date is {today_str}. "
+        "Use it to resolve any relative day references (e.g. 'this Friday', "
+        "'next Monday') into absolute ISO-8601 datetimes.\n\n"
+        "--- EMAIL THREAD ---\n"
+        f"{thread_text}\n"
+        "--- END THREAD ---\n\n"
+        "Extract the meeting details and return the JSON object now."
     )
 
-    last_exc: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                ),
+    # --- 3. Call Gemini -------------------------------------------------------
+    try:
+        import google.generativeai as genai  # type: ignore
+    except ImportError as exc:
+        return {"parsing_error": f"google-generativeai not installed: {exc}"}
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return {
+            "parsing_error": (
+                "GEMINI_API_KEY is not set. "
+                "Add it to .env or export it in your shell."
             )
-            raw = response.text.strip()
+        }
 
-            # Strip markdown code fences if Gemini wraps the JSON anyway
-            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            raw = raw.strip()
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=_GEMINI_MODEL,
+            system_instruction=system_instruction,
+        )
+        response = model.generate_content(
+            user_prompt,
+            generation_config={
+                "temperature": 0.2,   # low — we want deterministic extraction
+                "top_p": 0.9,
+                "max_output_tokens": 4096,
+            },
+        )
+        print("Complete response", response)
+        raw = (response.text or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        return {"parsing_error": f"Gemini call failed: {exc}"}
 
-            print(f"[parse_meeting_request] attempt {attempt + 1} raw:\n{raw}")
+    # --- 4. Strip fences and parse JSON --------------------------------------
+    cleaned = _FENCE_RE.sub("", raw).strip()
+    print("Response : ", cleaned)
+    try:
+        parsed: dict[str, Any] = _json.loads(cleaned)
+    except _json.JSONDecodeError as exc:
+        return {
+            "parsing_error": f"JSON parse failed: {exc}",
+            "raw_response": raw,
+        }
 
-            parsed = json.loads(raw)
-            print(f"[parse_meeting_request] parsed type: {type(parsed).__name__}")
+    # --- 5. Normalise / fill defaults ----------------------------------------
+    if not isinstance(parsed.get("proposed_times"), list):
+        parsed["proposed_times"] = []
 
-            # Unwrap accidental list wrapping
-            if isinstance(parsed, list):
-                if parsed and isinstance(parsed[0], dict):
-                    print("[parse_meeting_request] list detected — taking first element")
-                    parsed = parsed[0]
-                else:
-                    return {
-                        "parsing_error":
-                        f"Gemini returned a list with no dict inside: {raw[:200]}"
-                    }
+    if not isinstance(parsed.get("attendees"), list):
+        parsed["attendees"] = []
 
-            if not isinstance(parsed, dict):
-                return {
-                    "parsing_error":
-                    f"Unexpected type {type(parsed).__name__} from Gemini: {raw[:200]}"
-                }
+    if not isinstance(parsed.get("topic"), str):
+        parsed["topic"] = subject  # fall back to email subject
 
-            # Supplement Gemini's attendee list with real addresses from headers
-            header_emails = _extract_emails_from_thread(thread)
-            gemini_attendees = [
-                a.strip().lower()
-                for a in parsed.get("attendees", [])
-                if "@" in str(a)
-            ]
-            # Merge: header emails first (authoritative), then anything Gemini added
-            merged_attendees = list({**{e: None for e in header_emails},
-                                     **{e: None for e in gemini_attendees}}.keys())
+    if not isinstance(parsed.get("duration_minutes"), int):
+        parsed["duration_minutes"] = 30
 
-            return {
-                "proposed_times":   parsed.get("proposed_times", []),
-                "attendees":        merged_attendees,
-                "topic":            parsed.get("topic", ""),
-                "duration_minutes": int(parsed.get("duration_minutes", 30)),
-            }
-
-        except Exception as exc:
-            last_exc = exc
-            if _is_transient(exc) and attempt < 2:
-                wait = 2 ** (attempt + 1)   # 2s, 4s, 8s
-                print(
-                    f"[parse_meeting_request] transient error on attempt "
-                    f"{attempt + 1}: {exc} — retrying in {wait}s"
-                )
-                time.sleep(wait)
-            else:
-                # Non-transient or final attempt — log raw error, return friendly msg
-                print(
-                    f"[parse_meeting_request] non-retryable error: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                return {"parsing_error": _friendly_gemini_error(exc)}
-
-    return {"parsing_error": _friendly_gemini_error(last_exc)}
-
+    return parsed
 
 # ---------------------------------------------------------------------------
 # Availability helpers
 # ---------------------------------------------------------------------------
 
-def check_availability(
-    time_min: str,
-    time_max: str,
-    local_tz: timezone = _IST,
-) -> bool:
-    """
-    Query the FreeBusy API and return True if the window is free.
+def check_availability(time_min: str, time_max: str) -> bool:
+    """Query the FreeBusy API to check whether the primary calendar is free.
 
-    Both timestamps are normalised to UTC via _to_utc_rfc3339 so naive
-    IST times are not mistakenly sent as UTC (a 5:30 shift).
+    Parameters
+    ----------
+    time_min : str
+        Start of the window to check, as an ISO-8601 datetime string.
+        If the string has no timezone suffix (no ``+``/``-`` offset and
+        no trailing ``Z``), ``Z`` (UTC) is appended automatically.
+    time_max : str
+        End of the window, same format rules as ``time_min``.
 
-    Logs the exact UTC window sent, the raw busy list returned, and any
-    exceptions with full tracebacks instead of silently returning False.
+    Returns
+    -------
+    bool
+        ``True``  — the calendar has no events in [time_min, time_max).
+        ``False`` — the calendar is busy, or any error occurred (safe default).
     """
     try:
-        utc_min = _to_utc_rfc3339(time_min, local_tz)
-        utc_max = _to_utc_rfc3339(time_max, local_tz)
+        from datetime import datetime, timezone
 
-        print(f"[check_availability] FreeBusy query: {utc_min} → {utc_max}")
+        def _ensure_tz(ts: str) -> str:
+            """Append 'Z' to a naive ISO-8601 string (no offset, no Z)."""
+            ts = ts.strip()
+            if ts.endswith("Z"):
+                return ts
+            # Has an explicit UTC offset like +05:30 or -07:00 — leave as-is.
+            if "+" in ts[10:] or (ts.count("-") > 2):
+                return ts
+            return ts + "Z"
+
+        time_min = _ensure_tz(time_min)
+        time_max = _ensure_tz(time_max)
 
         service = _build_calendar_service()
-        result = service.freebusy().query(body={
-            "timeMin": utc_min,
-            "timeMax": utc_max,
+
+        body = {
+            "timeMin": time_min,
+            "timeMax": time_max,
             "items": [{"id": "primary"}],
-        }).execute()
+        }
 
+        result = service.freebusy().query(body=body).execute()
+
+        # result["calendars"]["primary"]["busy"] is a list of {start, end} dicts.
+        # An empty list means the slot is free.
         busy_slots = (
-            result.get("calendars", {}).get("primary", {}).get("busy", [])
+            result.get("calendars", {})
+                  .get("primary", {})
+                  .get("busy", [])
         )
-        print(f"[check_availability] busy slots: {busy_slots}")
-        is_free = len(busy_slots) == 0
-        print(f"[check_availability] → {'FREE' if is_free else 'BUSY'}")
-        return is_free
+        return len(busy_slots) == 0
 
-    except RuntimeError as exc:
-        # Re-raise scope/auth errors immediately — returning False here would
-        # silently mark every slot as busy and hide the real problem.
-        raise
-    except Exception as exc:
-        print(
-            f"[check_availability] ERROR — {type(exc).__name__}: {exc}\n"
-            + traceback.format_exc()
-        )
+    except Exception:  # noqa: BLE001 — any failure defaults to "busy" / unavailable
         return False
 
 
 def find_free_slot(
-    proposed_times: List[str],
+    proposed_times: list[str],
     duration_minutes: int = 30,
-    local_tz: timezone = _IST,
-) -> Optional[str]:
+) -> str | None:
+    """Return the first proposed time at which the primary calendar is free.
+
+    Iterates ``proposed_times`` in order. For each entry it:
+
+    1. Parses the ISO-8601 string (skips malformed entries silently).
+    2. Calculates ``time_max = time_min + duration_minutes``.
+    3. Calls ``check_availability(time_min, time_max)``.
+    4. Returns ``time_min`` on the first free slot found.
+
+    Parameters
+    ----------
+    proposed_times : list[str]
+        ISO-8601 datetime strings, typically from
+        ``parse_meeting_request()["proposed_times"]``.
+    duration_minutes : int
+        Length of the meeting in minutes.  Defaults to 30.
+
+    Returns
+    -------
+    str | None
+        The first free ``time_min`` string (as supplied, not normalised),
+        or ``None`` if no proposed time is available.
     """
-    Return the first proposed start time at which the primary calendar is free,
-    or None if no slot is available.
+    from datetime import datetime, timedelta, timezone
 
-    Naive datetime strings are treated as local_tz (default IST / UTC+5:30)
-    and converted to UTC before querying — so "14:00" means 14:00 IST,
-    not 14:00 UTC.
-
-    Malformed or date-only strings are skipped with a logged warning.
-    """
-    print(
-        f"[find_free_slot] {len(proposed_times)} slot(s), "
-        f"duration={duration_minutes} min, tz={local_tz}"
-    )
-
-    for start_str in proposed_times:
+    for raw_time in proposed_times:
+        # --- parse -------------------------------------------------------
         try:
-            utc_min = _to_utc_rfc3339(start_str, local_tz)
-            utc_start_dt = datetime.fromisoformat(utc_min[:-1]).replace(
-                tzinfo=timezone.utc
-            )
-            utc_end_dt = utc_start_dt + timedelta(minutes=duration_minutes)
-            utc_max = utc_end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            ts = raw_time.strip()
 
-            print(
-                f"[find_free_slot] '{start_str}' → UTC window: {utc_min} – {utc_max}"
-            )
+            # datetime.fromisoformat() in Python ≥ 3.11 handles the trailing
+            # 'Z'; for 3.9/3.10 we replace it with +00:00 first.
+            parse_ts = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+            dt_start = datetime.fromisoformat(parse_ts)
 
-            # Times are already UTC — pass timezone.utc to skip redundant conversion
-            if check_availability(utc_min, utc_max, local_tz=timezone.utc):
-                print(f"[find_free_slot] ✓ free slot: '{start_str}' (returning original local string to caller)")
-                return start_str
+            # Make timezone-aware (assume UTC for naive datetimes).
+            if dt_start.tzinfo is None:
+                dt_start = dt_start.replace(tzinfo=timezone.utc)
 
-        except RuntimeError:
-            # Auth/scope errors — propagate immediately rather than skipping the slot
-            raise
-        except Exception as exc:
-            print(
-                f"[find_free_slot] skipping '{start_str}': "
-                f"{type(exc).__name__}: {exc}"
-            )
+        except (ValueError, AttributeError):
+            # Malformed string — skip gracefully.
             continue
 
-    print("[find_free_slot] no free slot found")
+        # --- calculate end -----------------------------------------------
+        dt_end = dt_start + timedelta(minutes=max(duration_minutes, 1))
+
+        # Format as RFC-3339 / ISO-8601 with UTC offset for the API.
+        time_min = dt_start.isoformat()
+        time_max = dt_end.isoformat()
+
+        # --- check -------------------------------------------------------
+        if check_availability(time_min, time_max):
+            return raw_time  # return original string so callers can display it
+
     return None
 
 
 # ---------------------------------------------------------------------------
-# Event creation
+# Event creator
 # ---------------------------------------------------------------------------
 
 def create_event(
     summary: str,
     start_time: str,
     duration_minutes: int,
-    attendees: List[str],
+    attendees: list[str],
     description: str = "",
-    local_tz: timezone = _IST,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
+    """Create a Google Calendar event and send invitation emails to attendees.
+
+    Parameters
+    ----------
+    summary : str
+        Event title (maps to the Calendar ``summary`` field).
+    start_time : str
+        ISO-8601 datetime string for the event start.  Naive strings
+        (no timezone offset, no trailing ``Z``) are treated as UTC.
+    duration_minutes : int
+        Length of the event in minutes.  Must be >= 1.
+    attendees : list[str]
+        Email addresses to invite.  Entries that don't contain ``@`` are
+        silently filtered out before the API call.
+    description : str, optional
+        Free-text event description / agenda.  Defaults to ``""``.
+
+    Returns
+    -------
+    dict
+        The full event resource dict returned by the Calendar API, which
+        includes ``id``, ``htmlLink``, ``status``, ``start``, ``end``, and
+        the confirmed ``attendees`` list among other fields.
+
+    Raises
+    ------
+    Exception
+        Any error from the Calendar API or the OAuth flow is propagated
+        to the caller (unlike the availability helpers, here a failure
+        should be surfaced rather than silently swallowed).
     """
-    Create a Google Calendar event on the primary calendar and email invites
-    to all valid attendees.
+    from datetime import datetime, timedelta, timezone
 
-    start_time is treated as a naive local IST datetime string
-    (e.g. "2026-07-18T14:00:00") and passed directly to the Google Calendar
-    API with timeZone="Asia/Kolkata".  The API performs the IST→UTC conversion
-    internally, so Python never shifts the time and there is no risk of a
-    double-conversion.
+    # --- 1. Parse and normalise start_time ----------------------------------
+    ts = start_time.strip()
+    parse_ts = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+    dt_start = datetime.fromisoformat(parse_ts)
 
-    Attendees without "@" in their address are silently dropped.
+    if dt_start.tzinfo is None:
+        dt_start = dt_start.replace(tzinfo=timezone.utc)
 
-    Returns the full event resource dict from the Calendar API.
-    """
-    # Guard: never create an event with a blank title.
-    safe_summary = summary.strip() if summary and summary.strip() else "Meeting"
+    # --- 2. Calculate end time ----------------------------------------------
+    dt_end = dt_start + timedelta(minutes=max(duration_minutes, 1))
 
-    # ── Parse start_time as a local IST naive datetime ───────────────────
-    # Strip any trailing Z or offset so fromisoformat can handle it as naive.
-    clean_start = start_time.strip()
-    if clean_start.endswith("Z"):
-        clean_start = clean_start[:-1]
-    # Also strip an explicit +HH:MM or -HH:MM offset if present
-    clean_start = re.sub(r"[+-]\d{2}:\d{2}$", "", clean_start)
+    # Calendar API expects RFC-3339; isoformat() on tz-aware datetimes
+    # produces e.g. "2026-06-25T14:00:00+00:00" which the API accepts.
+    start_str = dt_start.isoformat()
+    end_str = dt_end.isoformat()
 
-    print(f"[create_event] raw start_time input : '{start_time}'")
-    print(f"[create_event] cleaned local IST str: '{clean_start}'")
+    # --- 3. Build event body ------------------------------------------------
+    event_body: dict[str, Any] = {
+        "summary": summary,
+        "description": description,
+        "start": {
+            "dateTime": start_str,
+            "timeZone": "UTC",
+        },
+        "end": {
+            "dateTime": end_str,
+            "timeZone": "UTC",
+        },
+    }
 
-    local_start_dt = datetime.fromisoformat(clean_start)
-    local_end_dt   = local_start_dt + timedelta(minutes=duration_minutes)
-
-    # Format as "YYYY-MM-DDTHH:MM:SS" — no Z, no offset; timeZone field carries the zone.
-    start_str = local_start_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    end_str   = local_end_dt.strftime("%Y-%m-%dT%H:%M:%S")
-
-    print(f"[create_event] local IST window    : {start_str} → {end_str} (Asia/Kolkata)")
-    print(f"[create_event] summary             : '{safe_summary}'")
-
+    # Only include attendees that look like real email addresses.
     valid_attendees = [
         {"email": addr.strip()}
         for addr in attendees
-        if "@" in str(addr)
+        if "@" in addr
     ]
-
-    event_body: Dict[str, Any] = {
-        "summary":     safe_summary,
-        "description": description,
-        "start": {"dateTime": start_str, "timeZone": "Asia/Kolkata"},
-        "end":   {"dateTime": end_str,   "timeZone": "Asia/Kolkata"},
-    }
     if valid_attendees:
         event_body["attendees"] = valid_attendees
 
-    print(
-        f"[create_event] API payload start: {event_body['start']} "
-        f"| attendees={[a['email'] for a in valid_attendees]}"
-    )
-
+    # --- 4. Insert via Calendar API -----------------------------------------
     service = _build_calendar_service()
-    created = service.events().insert(
-        calendarId="primary",
-        body=event_body,
-        sendUpdates="all",
-    ).execute()
 
-    print(
-        f"[create_event] created → id={created.get('id')} "
-        f"start={created.get('start')} link={created.get('htmlLink')}"
+    created: dict[str, Any] = (
+        service.events()
+        .insert(
+            calendarId="primary",
+            body=event_body,
+            sendUpdates="all",   # sends invitation emails to all attendees
+        )
+        .execute()
     )
+
     return created

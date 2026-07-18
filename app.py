@@ -1,1376 +1,1749 @@
-import os
+"""
+The Draft Desk — Streamlit UI for the Chief of Staff workflow.
+
+Phases (driven by session_state.current_phase):
+  1. Inbox and Triage
+  2. Draft Generation
+  3. Approval Gate
+  4. Export Proof
+"""
+
+from __future__ import annotations
+
 import json
-from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import streamlit as st
-from google import genai
-from dotenv import load_dotenv
-
-# Import our backend modules
-import engine
-import triage
-import context_builder
-import draft_machine
-from task_logger import log_action, get_action_log
-from draft_machine import GeminiError
+from task_logger import log_action, get_action_log  # type: ignore
 
 
-def _show_gemini_error(exc: Exception) -> None:
-    """
-    Display a clean, user-facing Streamlit error for a Gemini API failure.
-    If ``exc`` is a GeminiError raised by our backends, its ``.friendly``
-    message is shown directly.  Any other exception gets a generic message.
-    The full raw error is always printed to the console for debugging.
-    """
-    print(f"[app] Gemini error ({type(exc).__name__}): {exc}")
-    if isinstance(exc, GeminiError):
-        st.error(exc.friendly)
-    else:
-        msg = str(exc).lower()
-        if "503" in msg or "unavailable" in msg or "overloaded" in msg or "high demand" in msg:
-            st.error(
-                "⏳ Gemini is temporarily busy (free tier). "
-                "Please wait a moment and try again."
-            )
-        elif "429" in msg or "resource_exhausted" in msg or "quota" in msg or "rate" in msg:
-            st.error(
-                "⚠️ Daily free-tier quota reached for Gemini. "
-                "Please wait for it to reset, or upgrade your plan to continue."
-            )
-        else:
-            st.error("Something went wrong. Please try again.")
-
-# Load environment variables
-load_dotenv()
-
-# Set up page config
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="The Draft Desk",
     page_icon="✍️",
-    layout="wide"
+    layout="wide",
 )
 
-# Custom Styling for Dark Theme
-st.markdown(
-    """
-    <style>
-    /* Dark Theme background */
-    .stApp {
-        background-color: #1a1a2e;
-        color: #e0e0e0;
-    }
-    
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background-color: #161625 !important;
-        border-right: 1px solid #2d2d44;
-    }
-    
-    /* Thread boxes */
-    .thread-box {
-        background-color: #162447;
-        border: 1px solid #1f4068;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 12px;
-    }
-    
-    .thread-sender {
-        font-weight: bold;
-        color: #00bbee;
-        font-size: 0.95em;
-    }
-    
-    .thread-date {
-        font-size: 0.8em;
-        color: #8888aa;
-        float: right;
-    }
-    
-    .thread-body {
-        margin-top: 8px;
-        white-space: pre-wrap;
-        font-size: 0.9em;
-        color: #e0e0e0;
-    }
-    
-    /* Draft Display */
-    .draft-container {
-        background-color: #1f4068;
-        border: 2px solid #00bbee;
-        border-radius: 8px;
-        padding: 20px;
-        margin-bottom: 20px;
-        font-size: 1.05em;
-        line-height: 1.5;
-        white-space: pre-wrap;
-        color: #ffffff;
-    }
-    
-    /* Status indicators */
-    .status-approved {
-        background-color: #1b5e20;
-        border: 1px solid #4caf50;
-        color: #e8f5e9;
-        padding: 12px;
-        border-radius: 5px;
-        font-weight: bold;
-        margin-bottom: 15px;
-    }
-    
-    .status-rejected {
-        background-color: #b71c1c;
-        border: 1px solid #f44336;
-        color: #ffebee;
-        padding: 12px;
-        border-radius: 5px;
-        font-weight: bold;
-        margin-bottom: 15px;
-    }
-    
-    .metadata-badge {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.8em;
-        font-weight: bold;
-        margin-right: 5px;
-        margin-top: 5px;
-    }
-    .badge-priority-urgent { background-color: #e94560; color: #fff; }
-    .badge-priority-needs-reply { background-color: #f0a500; color: #fff; }
-    .badge-priority-fyi { background-color: #0f4c75; color: #fff; }
-    .badge-priority-ignore { background-color: #4e4e50; color: #fff; }
-    .badge-category { background-color: #3282b8; color: #fff; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
 
-# --- Monkey-patch context_builder and draft_machine for demo/sample mode ---
-# This ensures that if we are using the sample/offline flow, it doesn't fail on Gmail API calls.
-def app_get_thread_history(thread_id: str):
-    # Retrieve from our current threads in session state
-    if "threads" in st.session_state and st.session_state.threads:
-        for t in st.session_state.threads:
-            if t.get("id") == thread_id:
-                history = []
-                for msg in t.get("messages", []):
-                    history.append({
-                        "sender": msg.get("from", "unknown"),
-                        "date": msg.get("date", "unknown"),
-                        "content": msg.get("body", "")
-                    })
-                return history
-    return []
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+SAMPLE_THREADS_PATH = BASE_DIR / "sample_threads.json"
 
-def app_get_past_replies(limit: int = 3):
-    return [
-        {
-            "subject": "Re: Project proposal",
-            "content": "Let's proceed with the phase 1 rollout. I'll review the budget by tomorrow."
-        },
-        {
-            "subject": "Re: Meeting schedule",
-            "content": "Thanks for confirming. I'm available at 3 PM as proposed."
-        },
-        {
-            "subject": "Re: Quick Sync",
-            "content": "Sounds good. Let's touch base on Thursday afternoon."
-        }
-    ]
+PHASES = [
+    "Inbox and Triage",
+    "Draft Generation",
+    "Approval Gate",
+    "Export Proof",
+]
 
-# Apply monkey patching to avoid live external dependencies when showing demo flows
-engine.get_thread_history = app_get_thread_history
-engine.get_past_replies = app_get_past_replies
-context_builder.get_thread_history = app_get_thread_history
-context_builder.get_past_replies = app_get_past_replies
+# Triage buckets — keys match the strings triage.py emits, values are the
+# display order and the emoji/header used in the UI.
+PRIORITY_ORDER = ["urgent", "needs-reply", "fyi", "ignore"]
+PRIORITY_META = {
+    "urgent":      ("🚨 Urgent",      "Production incidents, blocking issues, deadlines today."),
+    "needs-reply": ("💬 Needs Reply", "Active conversations waiting on your response."),
+    "fyi":         ("📋 FYI",         "Informational only — no action required."),
+    "ignore":      ("🗑️ Ignore",      "Newsletters, marketing, low-signal noise."),
+}
 
 
-@st.cache_resource
+# ---------------------------------------------------------------------------
+# Lazy / safe imports of project modules
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _get_triage():
+    """Import triage_inbox once; cache so we don't re-execute triage.py's
+    module-level Gemini demo on every rerun."""
+    from triage import triage_inbox  # type: ignore
+    return triage_inbox
+
+
+@st.cache_resource(show_spinner=False)
 def _get_fetch_threads():
-    """Cached reference to engine.fetch_threads."""
-    return engine.fetch_threads
+    """Import fetch_threads once."""
+    from engine import fetch_threads  # type: ignore
+    return fetch_threads
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def _get_send_reply():
-    """Cached reference to engine.send_reply."""
-    from engine import send_reply
+    """Import send_reply once."""
+    from engine import send_reply  # type: ignore
     return send_reply
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
+def _get_fetch_full_thread():
+    """Import fetch_full_thread once."""
+    from engine import fetch_full_thread  # type: ignore
+    return fetch_full_thread
+
+
+@st.cache_resource(show_spinner=False)
 def _get_calendar_engine():
-    """Cached import of calendar_engine module."""
-    import calendar_engine
-    return calendar_engine
-
-
-# --- Session State Initialization ---
-if "threads" not in st.session_state:
-    st.session_state.threads = []
-if "triaged" not in st.session_state:
-    st.session_state.triaged = []
-if "drafts" not in st.session_state:
-    st.session_state.drafts = {}
-if "approved" not in st.session_state:
-    st.session_state.approved = {}
-if "rejected" not in st.session_state:
-    st.session_state.rejected = set()
-if "sent" not in st.session_state:
-    st.session_state.sent = set()
-if "booked" not in st.session_state:
-    st.session_state.booked = {}
-if "current_phase" not in st.session_state:
-    st.session_state.current_phase = "Inbox & Triage"
-if "pipeline_running" not in st.session_state:
-    st.session_state.pipeline_running = False
-if "pipeline_log" not in st.session_state:
-    st.session_state.pipeline_log = []
-
-# --- Sidebar Configuration & Navigation ---
-st.sidebar.title("✍️ The Draft Desk")
-st.sidebar.write("Human-in-the-Loop AI Email Ghostwriter")
-st.sidebar.write("---")
-
-# Run Full Pipeline button — fetches, triages, and drafts in one shot
-if st.sidebar.button(
-    "⚡ Run Full Pipeline",
-    type="primary",
-    use_container_width=True,
-    key="btn_run_pipeline",
-):
-    st.session_state.pipeline_running = True
-    st.rerun()
-st.sidebar.caption("Fetches, triages, and drafts — stops at Approval Gate.")
-
-# API key — read from environment (local .env) or Streamlit Secrets (Cloud deployment).
-# Never entered via the UI; set GEMINI_API_KEY in Streamlit → Settings → Secrets.
-_api_key = os.getenv("GEMINI_API_KEY")
-if not _api_key:
-    try:
-        _api_key = st.secrets["GEMINI_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        _api_key = None
-
-if _api_key:
-    import google.generativeai as legacy_genai
-    legacy_genai.configure(api_key=_api_key)
-    draft_machine.GEMINI_API_KEY = _api_key
-    draft_machine.client = genai.Client(api_key=_api_key)
-
-# Source selector
-# Determine the default index from session state so the widget reflects
-# the user's last choice after a rerun.
-_source_options = ["Sample threads for demo", "Gmail via engine.py"]
-_source_default_index = (
-    1 if st.session_state.get("source") == "Gmail via engine.py" else 0
-)
-source_selection = st.sidebar.radio(
-    "Data Source Selection:",
-    options=_source_options,
-    index=_source_default_index,
-)
-# Persist the selection so run_full_pipeline() and _render_pipeline_execution()
-# can read it from session state (they check st.session_state.source).
-st.session_state.source = source_selection
-
-st.sidebar.write("---")
-st.sidebar.subheader("Navigation Workflow")
-
-# Create buttons for workflow phase navigation
-phases = ["Inbox & Triage", "Draft Generation", "Approval Gate", "Export Proof"]
-for phase in phases:
-    # Highlight current active phase
-    is_active = st.session_state.current_phase == phase
-    button_label = f"👉 {phase}" if is_active else phase
-    if st.sidebar.button(button_label, key=f"nav_{phase}", use_container_width=True):
-        st.session_state.current_phase = phase
-        st.rerun()
-
-st.sidebar.write("---")
-# Quick stats in sidebar
-actionable_count = 0
-if st.session_state.triaged:
-    actionable_count = sum(
-        1 for t in st.session_state.triaged 
-        if t.get("priority") in ["urgent", "needs reply"]
+    """Import calendar_engine functions once."""
+    from calendar_engine import (  # type: ignore
+        parse_meeting_request,
+        find_free_slot,
+        create_event,
     )
-st.sidebar.metric("Actionable Threads", actionable_count)
-st.sidebar.metric("Drafts Generated", len(st.session_state.drafts))
-st.sidebar.metric("Approved Drafts", len(st.session_state.approved))
-
-# --- Main App Sections ---
+    return parse_meeting_request, find_free_slot, create_event
 
 
-# ==========================================
-# Pipeline helper functions
-# ==========================================
+# ---------------------------------------------------------------------------
+# Session state initialization
+# ---------------------------------------------------------------------------
+def _init_session_state() -> None:
+    """Initialize all session_state keys we rely on."""
+    defaults: dict[str, Any] = {
+        "threads": [],              # list[dict] — loaded email threads (UI format)
+        "triaged": {},              # dict[str, list[dict]] — priority -> [thread, ...]
+        "drafts": {},               # dict[str, str] — thread_id -> draft body
+        "approved": {},             # dict[str, str] — thread_id -> approved draft
+        "rejected": set(),          # set[str] — thread_ids that were rejected
+        "sent": set(),              # set[str] — thread_ids that have been sent
+        "booked": {},               # dict[str, dict] — thread_id -> Calendar event dict
+        "current_phase": "Inbox and Triage",
+        "source": "Sample threads", # "Sample threads" | "Gmail via engine.py"
+        "last_pull_summary": None,  # str | None — message shown after a pull
+        "pipeline_running": False,  # bool — True while _render_pipeline_execution runs
+        "pipeline_log": [],         # list[str] — log from last pipeline run
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def load_sample_threads() -> list:
-    """Load threads from sample_threads.json. Returns [] on any error."""
-    if not os.path.exists("sample_threads.json"):
+
+_init_session_state()
+
+
+# ---------------------------------------------------------------------------
+# Source adapters — both paths return threads in the UI shape:
+#   [{"id": str, "subject": str, "messages": [{"from", "date", "body"}, ...]}, ...]
+# ---------------------------------------------------------------------------
+def load_sample_threads() -> list[dict[str, Any]]:
+    """Load sample threads from disk; return [] on any failure."""
+    if not SAMPLE_THREADS_PATH.exists():
         return []
     try:
-        with open("sample_threads.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        print(f"[load_sample_threads] ERROR: {exc}")
+        with SAMPLE_THREADS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, OSError):
         return []
 
 
-def fetch_threads_via_engine() -> list:
+def _preview_from_body(body: str, limit: int = 200) -> str:
+    body = (body or "").strip().replace("\n", " ")
+    return body if len(body) <= limit else body[: limit - 1] + "…"
+
+
+def fetch_threads_via_engine() -> list[dict[str, Any]]:
     """
-    Fetch live threads from Gmail via engine.fetch_threads and normalise
-    them into the app's internal format:
-        [{id, subject, messages: [{from, date, body}]}]
-
-    Re-raises exceptions so callers can display them in the UI instead of
-    silently falling back to sample data.
+    Call engine.fetch_threads() and convert the result into the UI thread
+    shape. If engine.py returns an MCP-plan dict instead of a thread list
+    (because creds aren't configured), raise RuntimeError with a friendly
+    message so the caller can surface it.
     """
-    fetched = engine.fetch_threads(max_results=10)
-    raw = []
-    for f in fetched:
-        raw.append({
-            "id":      f.get("thread_id", ""),
-            "subject": f.get("subject", ""),
-            "messages": [{
-                "from": f.get("sender", ""),
-                "date": f.get("date", ""),
-                "body": f.get("snippet", ""),
-            }],
-        })
-    return raw
+    fetch_threads = _get_fetch_threads()
+    result = fetch_threads()
 
-
-def triage_threads(raw_threads: list) -> list:
-    """
-    Run triage.triage_inbox on raw_threads and merge the labels back by
-    thread id.  Returns the updated thread list (same objects, priority /
-    category / reason added in-place).
-    """
-    if not raw_threads:
-        return []
-
-    triage_inputs = []
-    for t in raw_threads:
-        first_msg = t["messages"][0] if t.get("messages") else {}
-        triage_inputs.append({
-            "id":      t.get("id", ""),
-            "sender":  first_msg.get("from", "unknown"),
-            "subject": t.get("subject", ""),
-            "snippet": first_msg.get("body", ""),
-        })
-
-    triaged_results = triage.triage_inbox(triage_inputs)
-    label_by_id = {r["id"]: r for r in triaged_results if r.get("id")}
-
-    for thread_data in raw_threads:
-        tid   = thread_data.get("id", "")
-        label = label_by_id.get(tid)
-        if label is None:
-            thread_data.setdefault("priority", "needs reply")
-            thread_data.setdefault("category", "other")
-            thread_data.setdefault("reason",   "Classification result not returned")
-        else:
-            thread_data["priority"] = label.get("priority", "needs reply")
-            thread_data["category"] = label.get("category", "other")
-            thread_data["reason"]   = label.get("reason",   "No reason provided")
-
-    return raw_threads
-
-
-@st.cache_resource
-def _get_draft_reply():
-    """Cached reference to draft_machine.draft_reply."""
-    return draft_machine.draft_reply
-
-
-def run_full_pipeline() -> list:
-    """
-    Run the complete fetch → triage → draft pipeline in one shot.
-
-    Steps
-    -----
-    1. Read st.session_state.source to decide the thread source.
-    2. Fetch threads with load_sample_threads() or fetch_threads_via_engine().
-    3. Triage threads with triage_threads().
-    4. Reset all downstream session state (drafts, approved, rejected, sent, booked).
-    5. For each urgent / needs-reply thread, call draft_reply and store in
-       st.session_state.drafts.  Failures are logged but do not abort the loop.
-    6. Set current_phase to "Approval Gate".
-    7. Return a list of log strings describing every step taken.
-
-    No UI calls are made here — callers are responsible for rendering the log.
-    """
-    log: list = []
-
-    # ── Step 1: resolve source ───────────────────────────────────────────
-    source = st.session_state.get("source", "Sample threads for demo")
-    use_gmail = source == "Gmail via engine.py"
-    log.append(f"[pipeline] source: {'Gmail via engine.py' if use_gmail else 'sample threads'}")
-
-    # ── Step 2: fetch ────────────────────────────────────────────────────
-    try:
-        if use_gmail:
-            raw_threads = fetch_threads_via_engine()
-        else:
-            raw_threads = load_sample_threads()
-        log.append(f"[pipeline] fetched {len(raw_threads)} thread(s)")
-    except Exception as exc:
-        log.append(f"[pipeline] FETCH ERROR: {exc}")
-        return log   # nothing more we can do
-
-    if not raw_threads:
-        log.append("[pipeline] no threads found — aborting pipeline")
-        return log
-
-    # ── Step 3: triage ───────────────────────────────────────────────────
-    try:
-        raw_threads = triage_threads(raw_threads)
-        st.session_state.threads = raw_threads
-        st.session_state.triaged = raw_threads
-        log.append(
-            f"[pipeline] triage complete — "
-            + ", ".join(
-                f"{p}: {sum(1 for t in raw_threads if t.get('priority') == p)}"
-                for p in ("urgent", "needs reply", "fyi", "ignore")
-            )
+    if not isinstance(result, list):
+        # engine.py returned an MCP plan — we can't run that from Streamlit.
+        raise RuntimeError(
+            "engine.fetch_threads() returned an MCP plan instead of thread "
+            "data. Gmail credentials (credentials.json / token.json) aren't "
+            "configured for direct use, and the MCP path must be driven by "
+            "an MCP-aware host. Run engine.py from a Cline session, or set "
+            "up Gmail OAuth credentials."
         )
-    except Exception as exc:
-        log.append(f"[pipeline] TRIAGE ERROR: {exc}")
+
+    converted: list[dict[str, Any]] = []
+    for t in result:
+        thread_id = t.get("thread_id") or t.get("id") or ""
+        sender = t.get("sender", "")
+        subject = t.get("subject", "(no subject)")
+        date = t.get("date", "")
+        snippet = t.get("snippet", "")
+
+        # engine.py gives us one normalized message per Gmail thread; we
+        # wrap it as a single-message thread in our UI shape so the rest
+        # of the app is consistent.
+        converted.append({
+            "id": thread_id,
+            "subject": subject,
+            "messages": [
+                {
+                    "from": sender,
+                    "date": date,
+                    "body": snippet,
+                }
+            ],
+        })
+    return converted
+
+
+def triage_threads(threads: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """
+    Run triage_inbox() over `threads` and group results by priority.
+
+    triage_inbox() expects dicts with {sender, subject, snippet} and
+    returns a sorted list of `{...thread, priority, category, reason}`
+    dicts. We adapt our UI-shape threads into that input, then bucket the
+    output back into a dict keyed by priority.
+    """
+    triage_inbox = _get_triage()
+
+    # Adapt: build the minimal {sender, subject, snippet} view that
+    # triage.py expects, while preserving the original thread so we can
+    # attach the triage metadata without losing message history.
+    triage_input: list[dict[str, Any]] = []
+    for t in threads:
+        messages = t.get("messages") or []
+        first = messages[0] if messages else {}
+        triage_input.append({
+            "_thread": t,                              # keep our UI thread around
+            "sender": first.get("from", ""),
+            "subject": t.get("subject", ""),
+            "snippet": _preview_from_body(first.get("body", ""), limit=200),
+        })
+
+    # Triage. This calls Gemini once per thread — may take a few seconds.
+    raw_results = triage_inbox(triage_input)
+
+    # Group by priority. Anything triage.py doesn't recognize falls into
+    # "ignore" so the UI never crashes on an unexpected label.
+    grouped: dict[str, list[dict[str, Any]]] = {p: [] for p in PRIORITY_ORDER}
+    for r in raw_results:
+        priority = (r.get("priority") or "ignore").lower()
+        if priority not in grouped:
+            priority = "ignore"
+        thread = r.get("_thread", {})
+        # Attach triage metadata onto our UI thread (don't mutate the
+        # underlying session_state list element directly — we stored it).
+        enriched = {
+            **thread,
+            "_priority": priority,
+            "_category": r.get("category", "other"),
+            "_reason": r.get("reason", ""),
+        }
+        grouped[priority].append(enriched)
+
+    return grouped
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline (fetch → triage → draft all, no UI)
+# ---------------------------------------------------------------------------
+
+def run_full_pipeline() -> list[str]:
+    """Run the complete fetch → triage → draft pipeline without rendering UI.
+
+    Reads ``st.session_state.source`` to decide where threads come from,
+    runs every stage end-to-end, stores all results in session state, and
+    advances ``current_phase`` to ``"Approval Gate"`` so the user lands
+    on the review screen.
+
+    Errors at any stage are caught, appended to the log, and execution
+    continues where possible — a single draft failure never aborts the
+    remaining drafts.
+
+    Returns
+    -------
+    list[str]
+        Ordered log lines describing what happened (suitable for display
+        in a ``st.code`` block or similar). Each line is prefixed with
+        ``[OK]``, ``[WARN]``, or ``[ERROR]``.
+    """
+    log: list[str] = []
+    source = st.session_state.source
+
+    # ------------------------------------------------------------------
+    # Step 1: Fetch threads
+    # ------------------------------------------------------------------
+    log.append(f"[OK] Source: {source}")
+    try:
+        if source == "Sample threads":
+            threads = load_sample_threads()
+            if not threads:
+                log.append(
+                    f"[ERROR] No threads found at {SAMPLE_THREADS_PATH.name}."
+                )
+                return log
+        else:
+            threads = fetch_threads_via_engine()
+            if not threads:
+                log.append("[WARN] Gmail returned 0 threads.")
+                return log
+        log.append(f"[OK] Fetched {len(threads)} thread(s).")
+    except Exception as exc:  # noqa: BLE001
+        log.append(f"[ERROR] Fetch failed: {exc}")
         return log
 
-    # ── Step 4: reset downstream state ───────────────────────────────────
-    st.session_state.drafts   = {}
+    st.session_state.threads = threads
+
+    # ------------------------------------------------------------------
+    # Step 2: Triage
+    # ------------------------------------------------------------------
+    try:
+        grouped = triage_threads(threads)
+        st.session_state.triaged = grouped
+        urgent_n = len(grouped.get("urgent", []))
+        needs_reply_n = len(grouped.get("needs-reply", []))
+        total_n = sum(len(v) for v in grouped.values())
+        log.append(
+            f"[OK] Triaged {total_n} thread(s): "
+            f"{urgent_n} urgent, {needs_reply_n} need reply."
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.append(f"[ERROR] Triage failed: {exc}")
+        # Keep threads in state so the inbox phase can show them.
+        st.session_state.triaged = {}
+        return log
+
+    # ------------------------------------------------------------------
+    # Step 3: Reset downstream state
+    # ------------------------------------------------------------------
+    st.session_state.drafts = {}
     st.session_state.approved = {}
     st.session_state.rejected = set()
-    st.session_state.sent     = set()
-    st.session_state.booked   = {}
-    log.append("[pipeline] downstream state reset (drafts / approved / rejected / sent / booked)")
+    st.session_state.sent = set()
+    st.session_state.booked = {}
+    log.append("[OK] Downstream state reset.")
 
-    # ── Step 5: draft urgent + needs-reply threads ───────────────────────
-    actionable = [
-        t for t in raw_threads
-        if t.get("priority") in ("urgent", "needs reply")
-    ]
-    log.append(f"[pipeline] {len(actionable)} actionable thread(s) to draft")
-
-    draft_fn = _get_draft_reply()
-    for t in actionable:
-        tid       = t.get("id", "")
-        subject   = t.get("subject", "(no subject)")
-        first_msg = t["messages"][0] if t.get("messages") else {}
-        try:
-            compat = {
-                "thread_id": tid,
-                "sender":    first_msg.get("from", ""),
-                "subject":   subject,
-                "snippet":   first_msg.get("body", ""),
-                "date":      first_msg.get("date", ""),
-                "priority":  t.get("priority", "needs reply"),
-                "category":  t.get("category", "other"),
-                "reason":    t.get("reason", ""),
-            }
-            draft_text = draft_fn(compat)
-            st.session_state.drafts[tid] = draft_text
-            log.append(f"[pipeline] ✓ drafted: '{subject}' (id={tid})")
-        except Exception as exc:
-            log.append(f"[pipeline] ✗ draft FAILED for '{subject}' (id={tid}): {exc}")
-            # continue to next thread
-
-    # ── Step 6: navigate to Approval Gate ────────────────────────────────
-    st.session_state.current_phase = "Approval Gate"
-    log.append(
-        f"[pipeline] done — {len(st.session_state.drafts)}/{len(actionable)} "
-        f"draft(s) generated. Navigating to Approval Gate."
+    # ------------------------------------------------------------------
+    # Step 4: Draft actionable threads
+    # ------------------------------------------------------------------
+    actionable = (
+        grouped.get("urgent", []) + grouped.get("needs-reply", [])
     )
+
+    if not actionable:
+        log.append("[WARN] No urgent or needs-reply threads — nothing to draft.")
+    else:
+        log.append(f"[OK] Drafting {len(actionable)} thread(s)…")
+        try:
+            draft_reply = _get_draft_reply()
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"[ERROR] Could not load draft_reply: {exc}")
+            return log
+
+        ok_count = 0
+        for i, thread in enumerate(actionable):
+            thread_id = thread.get("id", f"thread_{i}")
+            subject = thread.get("subject", "(no subject)")
+            try:
+                draft = draft_reply(thread)
+                st.session_state.drafts[thread_id] = draft
+                log.append(f"[OK] Draft {i + 1}/{len(actionable)}: {subject[:60]}")
+                ok_count += 1
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.drafts[thread_id] = f"[Draft failed: {exc}]"
+                log.append(
+                    f"[ERROR] Draft {i + 1}/{len(actionable)} failed "
+                    f"({subject[:50]}): {exc}"
+                )
+
+        log.append(
+            f"[OK] Drafting complete: {ok_count}/{len(actionable)} succeeded."
+        )
+
+    # ------------------------------------------------------------------
+    # Step 5: Advance phase
+    # ------------------------------------------------------------------
+    st.session_state.current_phase = "Approval Gate"
+    log.append("[OK] Phase → Approval Gate.")
 
     return log
 
 
+# ---------------------------------------------------------------------------
+# Pipeline execution with live UI
+# ---------------------------------------------------------------------------
+
 def _render_pipeline_execution() -> None:
+    """Run the full fetch → triage → draft pipeline with live status UI.
+
+    Uses ``st.status`` to show real-time progress. Each step updates the
+    status label while running and writes a result line on completion.
+    On fatal error the status collapses to the error state and returns
+    early. On full success it collapses to the complete state, then
+    advances the phase and reruns.
     """
-    Execute the full fetch → triage → draft pipeline with live progress UI.
-
-    Runs the same logic as run_full_pipeline() inline so each step can
-    update the st.status container before it begins and write a result line
-    as soon as it finishes.  No call to run_full_pipeline() is made.
-
-    After the status block closes:
-      - pipeline_log is stored in session state
-      - current_phase is set to "Approval Gate"
-      - pipeline_running is set to False
-      - st.rerun() is called so the UI reflects the new phase
-    """
-    log: list = []
-
-    # ── Resolve source (same logic as run_full_pipeline) ─────────────────
-    source = st.session_state.get("source", "Sample threads for demo")
-    use_gmail = source == "Gmail via engine.py"
-    source_label = "Gmail via engine.py" if use_gmail else "sample threads"
-    log.append(f"[pipeline] source: {source_label}")
+    source = st.session_state.source
+    log: list[str] = []
 
     with st.status("Running full pipeline…", expanded=True) as status:
 
-        # ── Step 1: Fetch ─────────────────────────────────────────────────
-        status.update(label=f"Step 1/3 — Fetching threads ({source_label})…")
+        # ------------------------------------------------------------------
+        # Step 1: Fetch
+        # ------------------------------------------------------------------
+        status.update(label="Step 1/3 — Fetching threads…")
         try:
-            raw_threads = (
-                fetch_threads_via_engine() if use_gmail else load_sample_threads()
-            )
-            if not raw_threads:
-                msg = "No threads found — nothing to process."
-                log.append(f"[pipeline] {msg}")
-                st.write(f"⚠️ {msg}")
-                status.update(label="Pipeline stopped — no threads.", state="error")
-                return
-            fetch_msg = f"Fetched {len(raw_threads)} thread(s)"
-            log.append(f"[pipeline] {fetch_msg}")
-            st.write(f"✅ {fetch_msg}")
-        except Exception as exc:
-            err = f"Fetch failed: {exc}"
-            log.append(f"[pipeline] FETCH ERROR: {exc}")
-            st.write(f"❌ {err}")
-            status.update(label="Pipeline failed at fetch step.", state="error")
+            if source == "Sample threads":
+                threads = load_sample_threads()
+                if not threads:
+                    msg = f"No threads found at {SAMPLE_THREADS_PATH.name}."
+                    st.write(f"❌ Fetch: {msg}")
+                    log.append(f"[ERROR] {msg}")
+                    status.update(label="Pipeline failed — no threads found.", state="error")
+                    st.session_state.pipeline_running = False
+                    return
+            else:
+                threads = fetch_threads_via_engine()
+                if not threads:
+                    msg = "Gmail returned 0 threads."
+                    st.write(f"⚠️ Fetch: {msg}")
+                    log.append(f"[WARN] {msg}")
+                    status.update(label="Pipeline stopped — inbox is empty.", state="error")
+                    st.session_state.pipeline_running = False
+                    return
+
+            st.session_state.threads = threads
+            line = f"✅ Fetched {len(threads)} thread(s) from {source}."
+            st.write(line)
+            log.append(f"[OK] {line}")
+
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Fetch failed: {exc}"
+            st.write(f"❌ {msg}")
+            log.append(f"[ERROR] {msg}")
+            status.update(label="Pipeline failed — could not fetch threads.", state="error")
+            st.session_state.pipeline_running = False
             return
 
-        # ── Step 2: Triage ────────────────────────────────────────────────
-        status.update(label="Step 2/3 — Triaging threads with Gemini…")
+        # ------------------------------------------------------------------
+        # Step 2: Triage
+        # ------------------------------------------------------------------
+        status.update(label="Step 2/3 — Triaging threads…")
         try:
-            raw_threads = triage_threads(raw_threads)
-            st.session_state.threads = raw_threads
-            st.session_state.triaged = raw_threads
+            grouped = triage_threads(threads)
+            st.session_state.triaged = grouped
 
-            priority_summary = ", ".join(
-                f"{p}: {sum(1 for t in raw_threads if t.get('priority') == p)}"
-                for p in ("urgent", "needs reply", "fyi", "ignore")
+            urgent_n = len(grouped.get("urgent", []))
+            needs_reply_n = len(grouped.get("needs-reply", []))
+            total_n = sum(len(v) for v in grouped.values())
+
+            line = (
+                f"✅ Triaged {total_n} thread(s): "
+                f"{urgent_n} urgent · {needs_reply_n} need reply."
             )
-            triage_msg = f"Triage complete — {priority_summary}"
-            log.append(f"[pipeline] {triage_msg}")
-            st.write(f"✅ {triage_msg}")
-        except Exception as exc:
-            err = f"Triage failed: {exc}"
-            log.append(f"[pipeline] TRIAGE ERROR: {exc}")
-            st.write(f"❌ {err}")
-            status.update(label="Pipeline failed at triage step.", state="error")
+            st.write(line)
+            log.append(f"[OK] {line}")
+
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Triage failed: {exc}"
+            st.write(f"❌ {msg}")
+            log.append(f"[ERROR] {msg}")
+            status.update(label="Pipeline failed — triage error.", state="error")
+            st.session_state.pipeline_running = False
             return
 
-        # ── Reset downstream state ────────────────────────────────────────
-        st.session_state.drafts   = {}
+        # Reset downstream state after a successful triage
+        st.session_state.drafts = {}
         st.session_state.approved = {}
         st.session_state.rejected = set()
-        st.session_state.sent     = set()
-        st.session_state.booked   = {}
-        log.append("[pipeline] downstream state reset")
+        st.session_state.sent = set()
+        st.session_state.booked = {}
 
-        # ── Step 3: Draft loop ────────────────────────────────────────────
-        actionable = [
-            t for t in raw_threads
-            if t.get("priority") in ("urgent", "needs reply")
-        ]
-        status.update(
-            label=f"Step 3/3 — Drafting {len(actionable)} actionable thread(s)…"
+        # ------------------------------------------------------------------
+        # Step 3: Draft loop
+        # ------------------------------------------------------------------
+        actionable = (
+            grouped.get("urgent", []) + grouped.get("needs-reply", [])
         )
-        log.append(f"[pipeline] {len(actionable)} actionable thread(s) to draft")
 
-        draft_fn   = _get_draft_reply()
-        n_ok       = 0
-        n_fail     = 0
+        if not actionable:
+            line = "⚠️ No urgent or needs-reply threads — nothing to draft."
+            st.write(line)
+            log.append(f"[WARN] {line}")
+        else:
+            status.update(label=f"Step 3/3 — Drafting {len(actionable)} thread(s)…")
 
-        for t in actionable:
-            tid       = t.get("id", "")
-            subject   = t.get("subject", "(no subject)")
-            first_msg = t["messages"][0] if t.get("messages") else {}
             try:
-                compat = {
-                    "thread_id": tid,
-                    "sender":    first_msg.get("from", ""),
-                    "subject":   subject,
-                    "snippet":   first_msg.get("body", ""),
-                    "date":      first_msg.get("date", ""),
-                    "priority":  t.get("priority", "needs reply"),
-                    "category":  t.get("category", "other"),
-                    "reason":    t.get("reason", ""),
-                }
-                draft_text = draft_fn(compat)
-                st.session_state.drafts[tid] = draft_text
-                n_ok += 1
-                log.append(f"[pipeline] ✓ drafted: '{subject}' (id={tid})")
-                st.write(f"✅ Drafted: *{subject}*")
-            except Exception as exc:
-                n_fail += 1
-                log.append(
-                    f"[pipeline] ✗ draft FAILED for '{subject}' (id={tid}): {exc}"
+                draft_reply = _get_draft_reply()
+            except Exception as exc:  # noqa: BLE001
+                msg = f"Could not load draft_reply: {exc}"
+                st.write(f"❌ {msg}")
+                log.append(f"[ERROR] {msg}")
+                status.update(label="Pipeline failed — draft engine unavailable.", state="error")
+                st.session_state.pipeline_running = False
+                return
+
+            ok_count = 0
+            for i, thread in enumerate(actionable):
+                thread_id = thread.get("id", f"thread_{i}")
+                subject = thread.get("subject", "(no subject)")
+                status.update(
+                    label=(
+                        f"Step 3/3 — Drafting {i + 1}/{len(actionable)}: "
+                        f"{subject[:55]}…"
+                    )
                 )
-                st.write(f"❌ Failed to draft: *{subject}* — {exc}")
-                # continue to next thread
+                try:
+                    draft = draft_reply(thread)
+                    st.session_state.drafts[thread_id] = draft
+                    st.write(f"✅ Draft {i + 1}/{len(actionable)}: {subject[:60]}")
+                    log.append(f"[OK] Draft {i + 1}/{len(actionable)}: {subject[:60]}")
+                    ok_count += 1
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state.drafts[thread_id] = f"[Draft failed: {exc}]"
+                    st.write(f"❌ Draft {i + 1}/{len(actionable)} failed ({subject[:45]}): {exc}")
+                    log.append(
+                        f"[ERROR] Draft {i + 1}/{len(actionable)} failed "
+                        f"({subject[:50]}): {exc}"
+                    )
+                    # Continue — don't abort remaining drafts
 
-        done_msg = (
-            f"Done — {n_ok}/{len(actionable)} draft(s) generated"
-            + (f", {n_fail} failed" if n_fail else "")
-            + ". Proceeding to Approval Gate."
-        )
-        log.append(f"[pipeline] {done_msg}")
-        st.write(f"✅ {done_msg}")
-        status.update(label=done_msg, state="complete")
+            line = f"✅ Drafting complete: {ok_count}/{len(actionable)} succeeded."
+            st.write(line)
+            log.append(f"[OK] {line}")
 
-    # ── Outside the status block ──────────────────────────────────────────
-    st.session_state.pipeline_log     = log
-    st.session_state.current_phase    = "Approval Gate"
+        status.update(label="Pipeline complete — reviewing drafts.", state="complete")
+
+    # Outside the status block — state changes + rerun
+    st.session_state.pipeline_log = log
+    st.session_state.current_phase = "Approval Gate"
     st.session_state.pipeline_running = False
     st.rerun()
 
 
-# ==========================================
-# Phase 1: Inbox & Triage
-# ==========================================
-if st.session_state.pipeline_running:
-    _render_pipeline_execution()
-elif st.session_state.current_phase == "Inbox & Triage":
-    st.title("📥 Inbox & Triage")
-    st.write("Fetch incoming email threads and classify them by priority and category using Gemini.")
-    
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        pull_triage = st.button("🔄 Pull & Triage Threads", type="primary", use_container_width=True)
-    
-    if pull_triage:
-        with st.spinner("Fetching and classifying threads..."):
-            try:
-                raw_threads = []
-                if source_selection == "Gmail via engine.py":
-                    # Call fetch_threads() from engine.py
-                    fetched = engine.fetch_threads(max_results=10)
-                    
-                    # Convert to required unified format: [{id, subject, messages: [{from, date, body}]}]
-                    for f in fetched:
-                        raw_threads.append({
-                            "id": f.get("thread_id", ""),
-                            "subject": f.get("subject", ""),
-                            "messages": [
-                                {
-                                    "from": f.get("sender", ""),
-                                    "date": f.get("date", ""),
-                                    "body": f.get("snippet", "")
-                                }
-                            ]
-                        })
-                else:
-                    # Load from sample_threads.json
-                    if os.path.exists("sample_threads.json"):
-                        with open("sample_threads.json", "r", encoding="utf-8") as f:
-                            raw_threads = json.load(f)
-                    else:
-                        st.error("sample_threads.json not found! Please make sure it was created.")
-                
-                # We need to triage them using triage_inbox()
-                # Include the thread "id" so triage.py can match results back
-                # by ID rather than array position (the sort inside triage_inbox
-                # would otherwise misalign labels with threads).
-                triage_inputs = []
-                for t in raw_threads:
-                    first_msg = t["messages"][0] if t["messages"] else {}
-                    triage_inputs.append({
-                        "id":      t.get("id", ""),
-                        "sender":  first_msg.get("from", "unknown"),
-                        "subject": t.get("subject", ""),
-                        "snippet": first_msg.get("body", "")
-                    })
-                
-                # Classify
-                triaged_results = triage.triage_inbox(triage_inputs)
-                
-                # Combine raw_threads with their labels.
-                # Match by "id" — never by list position — because triage_inbox
-                # sorts results by priority, so positional indexing is wrong.
-                label_by_id = {r["id"]: r for r in triaged_results if r.get("id")}
-                
-                updated_threads = []
-                for thread_data in raw_threads:
-                    tid = thread_data.get("id", "")
-                    label = label_by_id.get(tid)
-                    if label is None:
-                        # Fallback: no label came back for this thread
-                        print(f"[app] WARNING: no triage label for thread id='{tid}' subject='{thread_data.get('subject','')}' — using defaults")
-                        thread_data["priority"] = "needs reply"
-                        thread_data["category"] = "other"
-                        thread_data["reason"]   = "Classification result not returned"
-                    else:
-                        thread_data["priority"] = label.get("priority", "needs reply")
-                        thread_data["category"] = label.get("category", "other")
-                        thread_data["reason"]   = label.get("reason", "No reason provided")
-                    updated_threads.append(thread_data)
-                
-                # Save to session state
-                st.session_state.threads = updated_threads
-                st.session_state.triaged = updated_threads
-                st.success(f"Successfully loaded and triaged {len(updated_threads)} email threads!")
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+def render_thread_card(thread: dict[str, Any]) -> None:
+    """Render a single thread as a compact, expandable card."""
+    subject = thread.get("subject", "(no subject)")
+    thread_id = thread.get("id", "?")
+    messages = thread.get("messages", []) or []
+
+    first = messages[0] if messages else {}
+    sender = first.get("from", "Unknown sender")
+    date = first.get("date", "")
+    preview = _preview_from_body(first.get("body", ""), limit=180)
+    reason = thread.get("_reason", "")
+
+    with st.container(border=True):
+        col_a, col_b = st.columns([4, 1])
+        with col_a:
+            st.markdown(f"**{subject}**")
+            st.caption(
+                f"From: {sender}  •  {date}  •  {len(messages)} message(s)"
+            )
+            if reason:
+                st.caption(f"_Why: {reason}_")
+            st.write(preview)
+        with col_b:
+            st.caption(f"ID: `{thread_id}`")
+            with st.popover("Open"):
+                for i, msg in enumerate(messages, start=1):
+                    st.markdown(
+                        f"**{i}. {msg.get('from', '?')}** "
+                        f"· {msg.get('date', '')}"
+                    )
+                    st.write(msg.get("body", ""))
+                    if i < len(messages):
+                        st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.title("✍️ The Draft Desk")
+        st.caption("Chief of Staff — Draft workflow")
+        st.divider()
+
+        if st.button(
+            "⚡ Run Full Pipeline",
+            type="primary",
+            use_container_width=True,
+            key="run_pipeline_btn",
+        ):
+            st.session_state.pipeline_running = True
+            st.rerun()
+        st.caption("Fetches, triages, and drafts — stops at Approval Gate.")
+
+        st.divider()
+        st.subheader("Source")
+        st.session_state.source = st.radio(
+            "Where do threads come from?",
+            options=["Sample threads", "Gmail via engine.py"],
+            index=0 if st.session_state.source == "Sample threads" else 1,
+            label_visibility="collapsed",
+            key="source_radio",
+        )
+
+        if st.session_state.source == "Gmail via engine.py":
+            st.caption("Pulls live threads via engine.fetch_threads().")
+
+        st.divider()
+        st.subheader("Navigation")
+
+        for phase in PHASES:
+            is_current = st.session_state.current_phase == phase
+            label = f"▶ {phase}" if is_current else phase
+            if st.button(label, key=f"nav_{phase}", use_container_width=True):
+                st.session_state.current_phase = phase
                 st.rerun()
-                
-            except Exception as e:
-                _show_gemini_error(e)
-                
-    # Display threads grouped by priority
-    if st.session_state.triaged:
-        priorities = ["urgent", "needs reply", "fyi", "ignore"]
-        
-        # Display stat counts
-        st.subheader("📬 Triaged Mailbox")
-        
-        # Group threads
-        by_priority = {p: [] for p in priorities}
-        for t in st.session_state.triaged:
-            p = t.get("priority", "needs reply")
-            if p in by_priority:
-                by_priority[p].append(t)
-            else:
-                by_priority["needs reply"].append(t)
-                
-        # Draw expanders for each priority category
-        for p in priorities:
-            threads_in_p = by_priority[p]
-            count = len(threads_in_p)
-            header_text = f"{p.upper()} ({count})"
-            
-            with st.expander(header_text, expanded=(p in ["urgent", "needs reply"])):
-                if not threads_in_p:
-                    st.write("*No threads in this category.*")
-                else:
-                    for t in threads_in_p:
-                        # Display individual thread
-                        col_hdr, col_badge = st.columns([4, 1])
-                        with col_hdr:
-                            st.markdown(f"**Subject:** {t.get('subject')}")
-                        with col_badge:
-                            st.markdown(
-                                f'<span class="metadata-badge badge-category">{t.get("category", "other").upper()}</span>',
-                                unsafe_allow_html=True
-                            )
-                        
-                        first_msg = t["messages"][0] if t["messages"] else {}
-                        st.markdown(f"**From:** {first_msg.get('from')} | **Date:** {first_msg.get('date')}")
-                        st.markdown(f"*Reason:* {t.get('reason')}")
-                        
-                        # Preview content
-                        st.markdown(
-                            f"""
-                            <div class="thread-box" style="border-left: 4px solid #00bbee;">
-                                <div class="thread-body">{first_msg.get('body')}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-                        st.write("---")
-    else:
-        st.info("Click the **'Pull & Triage Threads'** button above to load your inbox.")
 
-# ==========================================
-# Phase 2: Draft Generation
-# ==========================================
-elif st.session_state.current_phase == "Draft Generation":
-    st.title("🤖 Draft Generation")
-    st.write("Generate high-quality email replies for actionable threads using the persona rules and context builder.")
-    
-    if not st.session_state.triaged:
-        st.warning("Please go to the 'Inbox & Triage' phase and pull threads first!")
-    else:
-        # Filter to actionable threads (urgent + needs reply)
-        actionable_threads = [
-            t for t in st.session_state.triaged 
-            if t.get("priority") in ["urgent", "needs reply"]
-        ]
-        
-        if not actionable_threads:
-            st.success("🎉 No actionable threads (urgent/needs reply) found! All clear.")
+        st.divider()
+        triaged_total = sum(len(v) for v in st.session_state.triaged.values())
+        st.caption(
+            f"Loaded: **{len(st.session_state.threads)}** thread(s)  \n"
+            f"Triaged: **{triaged_total}**  \n"
+            f"Drafts: **{len(st.session_state.drafts)}**  \n"
+            f"Approved: **{len(st.session_state.approved)}**  \n"
+            f"Rejected: **{len(st.session_state.rejected)}**  \n"
+            f"Sent: **{len(st.session_state.sent)}**  \n"
+            f"Booked: **{len(st.session_state.booked)}**"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase: Inbox and Triage
+# ---------------------------------------------------------------------------
+def _do_pull_and_triage() -> tuple[list[dict[str, Any]] | None, str | None]:
+    """
+    Pull threads from the selected source, run triage, and store results
+    in session_state. Returns (loaded_threads_or_None, summary_message_or_None).
+    """
+    source = st.session_state.source
+
+    # 1) Load threads (UI shape)
+    try:
+        if source == "Sample threads":
+            threads = load_sample_threads()
+            if not threads:
+                return None, (
+                    f"error: No threads found at `{SAMPLE_THREADS_PATH.name}`. "
+                    "Make sure the file exists and is valid JSON."
+                )
         else:
-            st.subheader(f"Actionable Threads requiring Drafts ({len(actionable_threads)})")
-            
-            for t in actionable_threads:
-                tid = t.get("id")
-                first_msg = t["messages"][0] if t["messages"] else {}
-                
-                with st.container():
-                    col_det, col_action = st.columns([3, 1])
-                    with col_det:
-                        st.markdown(f"### {t.get('subject')}")
-                        st.markdown(f"**From:** {first_msg.get('from')} | **Priority:** `{t.get('priority').upper()}` | **Category:** `{t.get('category')}`")
-                        st.markdown(f"*Snippet:* {first_msg.get('body')[:150]}...")
-                    
-                    with col_action:
-                        # Show current draft status if generated
-                        has_draft = tid in st.session_state.drafts
-                        has_approved = tid in st.session_state.approved
-                        has_rejected = tid in st.session_state.rejected
-                        
-                        if has_approved:
-                            st.success("✅ Approved")
-                        elif has_rejected:
-                            st.error("❌ Rejected")
-                        elif has_draft:
-                            st.info("⚡ Draft Ready")
-                        else:
-                            st.write("*No Draft Generated*")
-                            
-                        # Generate Draft button
-                        if st.button("✨ Generate / Regenerate Reply", key=f"gen_{tid}", use_container_width=True):
-                            with st.spinner("Drafting with Gemini..."):
-                                try:
-                                    # Format the input thread to match draft_machine's expectations
-                                    # (thread_id, sender, subject, snippet, date, priority, category, reason)
-                                    compat_thread = {
-                                        "thread_id": tid,
-                                        "sender": first_msg.get("from", ""),
-                                        "subject": t.get("subject", ""),
-                                        "snippet": first_msg.get("body", ""),
-                                        "date": first_msg.get("date", ""),
-                                        "priority": t.get("priority", "needs reply"),
-                                        "category": t.get("category", "project"),
-                                        "reason": t.get("reason", "")
-                                    }
-                                    
-                                    draft_text = draft_machine.draft_reply(compat_thread)
-                                    st.session_state.drafts[tid] = draft_text
-                                    # Remove from rejected set if regenerated
-                                    if tid in st.session_state.rejected:
-                                        st.session_state.rejected.remove(tid)
-                                    st.success("Draft created!")
-                                    st.rerun()
-                                except Exception as e:
-                                    _show_gemini_error(e)
-                                        
-                    # Display existing draft
-                    if tid in st.session_state.drafts:
-                        with st.expander("View Generated Draft", expanded=False):
-                            st.markdown(
-                                f"""
-                                <div class="draft-container">
-                                {st.session_state.drafts[tid]}
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-                    st.write("---")
+            threads = fetch_threads_via_engine()
+            if not threads:
+                return None, "info: Gmail returned 0 threads."
+    except Exception as e:  # noqa: BLE001 — surface anything to the UI
+        return None, f"error: Failed to pull from {source}: {e}"
 
-# ==========================================
-# Phase 3: Approval Gate
-# ==========================================
-elif st.session_state.current_phase == "Approval Gate":
-    st.title("🎛️ Approval Gate")
-    st.write("Review, edit, and approve individual draft replies before finalizing.")
+    # 2) Triage. Errors here usually mean GEMINI_API_KEY isn't set.
+    try:
+        grouped = triage_threads(threads)
+    except Exception as e:  # noqa: BLE001
+        # We still keep the raw threads loaded so the user can see them.
+        st.session_state.threads = threads
+        st.session_state.triaged = {}
+        return threads, (
+            f"error: Loaded {len(threads)} thread(s) but triage failed: {e}"
+        )
 
-    # Pipeline execution log — shown only when the pipeline has been run
-    if st.session_state.get("pipeline_log"):
-        with st.expander("Pipeline Execution Log", expanded=False):
-            for entry in st.session_state.pipeline_log:
-                is_failure = "ERROR" in entry or "FAILED" in entry
-                prefix = "❌" if is_failure else "✅"
-                st.write(f"{prefix} {entry}")
-            if st.button("Clear log", key="btn_clear_pipeline_log"):
+    # 3) Persist.
+    st.session_state.threads = threads
+    st.session_state.triaged = grouped
+    # Drafting state is downstream — reset on every fresh pull.
+    st.session_state.drafts = {}
+    st.session_state.approved = {}
+    st.session_state.rejected = set()
+
+    total = sum(len(v) for v in grouped.values())
+    urgent = len(grouped.get("urgent", []))
+    needs_reply = len(grouped.get("needs-reply", []))
+    summary = (
+        f"success: Pulled {len(threads)} thread(s) from {source}. "
+        f"Triaged {total}: 🚨 {urgent} urgent · 💬 {needs_reply} need reply."
+    )
+    return threads, summary
+
+
+def _flash_summary(summary: str | None) -> None:
+    if not summary:
+        return
+    kind, _, message = summary.partition(":")
+    if kind == "error":
+        st.error(message.strip())
+    elif kind == "info":
+        st.info(message.strip())
+    else:
+        st.success(message.strip())
+
+
+def render_inbox_phase() -> None:
+    st.header("📥 Inbox and Triage")
+    st.write(
+        "Pull threads from the selected source, then triage them by priority. "
+        "Once triaged, the highest-priority threads move to *Draft Generation*."
+    )
+
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        pull_clicked = st.button(
+            "Pull & Triage",
+            type="primary",
+            use_container_width=True,
+        )
+    with col2:
+        if st.button("Clear", use_container_width=True):
+            st.session_state.threads = []
+            st.session_state.triaged = {}
+            st.session_state.drafts = {}
+            st.session_state.approved = {}
+            st.session_state.rejected = set()
+            st.session_state.last_pull_summary = None
+            st.rerun()
+
+    if pull_clicked:
+        with st.spinner("Pulling & triaging…"):
+            _, summary = _do_pull_and_triage()
+        st.session_state.last_pull_summary = summary
+        st.rerun()
+
+    _flash_summary(st.session_state.last_pull_summary)
+
+    st.divider()
+
+    triaged: dict[str, list[dict[str, Any]]] = st.session_state.triaged or {}
+    has_triaged = any(triaged.get(p) for p in PRIORITY_ORDER)
+
+    if not has_triaged:
+        # Fallback: show raw threads if we have them but triage is empty
+        # (e.g. triage errored but pull succeeded).
+        threads = st.session_state.threads
+        if threads:
+            st.warning(
+                "Triage didn't produce any buckets. Showing raw threads "
+                "below — pull again once the issue is resolved."
+            )
+            _render_raw_threads(threads)
+        else:
+            st.info("No threads loaded yet. Click **Pull & Triage** to get started.")
+        return
+
+    # Sort options for each bucket
+    sort_options = ["Most recent first", "Oldest first", "Most messages first"]
+    sort_by = st.selectbox("Sort by", options=sort_options, index=0, key="sort_by")
+
+    # Track how many need a reply so we can show the footer CTA
+    needs_reply_count = len(triaged.get("needs-reply", []))
+    urgent_count = len(triaged.get("urgent", []))
+
+    for priority in PRIORITY_ORDER:
+        bucket = triaged.get(priority, [])
+        if not bucket:
+            continue
+        header, blurb = PRIORITY_META[priority]
+        st.subheader(f"{header}  ({len(bucket)})")
+        st.caption(blurb)
+
+        sorted_bucket = _sort_threads(bucket, sort_by)
+        for thread in sorted_bucket:
+            label = f"{thread.get('subject', '(no subject)')}"
+            reason = thread.get("_reason", "")
+            category = thread.get("_category", "")
+            if reason:
+                label += f"  —  _{reason}_"
+            if category:
+                label += f"  ·  `{category}`"
+            with st.expander(label, expanded=False):
+                for i, msg in enumerate(thread.get("messages", []), start=1):
+                    st.markdown(
+                        f"**{i}. {msg.get('from', '?')}** "
+                        f"· {msg.get('date', '')}"
+                    )
+                    st.write(msg.get("body", ""))
+                    if i < len(thread.get("messages", [])):
+                        st.divider()
+                st.caption(f"Thread ID: `{thread.get('id', '?')}`")
+
+    # Footer CTA — count of threads that warrant a reply
+    reply_total = urgent_count + needs_reply_count
+    st.divider()
+    if reply_total > 0:
+        st.success(
+            f"**{reply_total}** thread(s) need a reply → go to **Draft Generation**"
+        )
+    else:
+        st.info("Nothing needs a reply right now. 🎉")
+
+
+def _sort_threads(
+    threads: list[dict[str, Any]], sort_by: str
+) -> list[dict[str, Any]]:
+    sorted_threads = list(threads)
+    if sort_by == "Most recent first":
+        sorted_threads.sort(
+            key=lambda t: (t.get("messages") or [{}])[0].get("date", ""),
+            reverse=True,
+        )
+    elif sort_by == "Oldest first":
+        sorted_threads.sort(
+            key=lambda t: (t.get("messages") or [{}])[0].get("date", ""),
+        )
+    else:  # Most messages first
+        sorted_threads.sort(
+            key=lambda t: len(t.get("messages") or []),
+            reverse=True,
+        )
+    return sorted_threads
+
+
+def _render_raw_threads(threads: list[dict[str, Any]]) -> None:
+    """Fallback renderer when triage failed but threads are loaded."""
+    for thread in threads:
+        render_thread_card(thread)
+
+
+# ---------------------------------------------------------------------------
+# Phase: Draft Generation
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _get_draft_reply():
+    """Import draft_reply once and cache it."""
+    from draft_machine import draft_reply  # type: ignore
+    return draft_reply
+
+
+def render_draft_phase() -> None:
+    st.header("📝 Draft Generation")
+    st.write(
+        "Generate AI drafts for every thread that needs a reply. "
+        "Drafts are built from your tone profile and past replies."
+    )
+
+    triaged: dict[str, list[dict[str, Any]]] = st.session_state.triaged or {}
+    actionable: list[dict[str, Any]] = (
+        triaged.get("urgent", []) + triaged.get("needs-reply", [])
+    )
+
+    if not actionable:
+        st.warning(
+            "No actionable threads found. "
+            "Go back to **Inbox and Triage** and run **Pull & Triage** first."
+        )
+        return
+
+    already_drafted = len(st.session_state.drafts)
+    st.caption(
+        f"{len(actionable)} thread(s) need a reply · "
+        f"{already_drafted} draft(s) already generated"
+    )
+
+    generate_clicked = st.button(
+        "⚡ Generate All Drafts",
+        type="primary",
+        disabled=(already_drafted == len(actionable)),
+    )
+
+    if generate_clicked:
+        draft_reply = _get_draft_reply()
+        progress_bar = st.progress(0, text="Starting…")
+        errors: list[str] = []
+
+        for i, thread in enumerate(actionable):
+            thread_id = thread.get("id", f"thread_{i}")
+            subject = thread.get("subject", "(no subject)")
+            progress_bar.progress(
+                i / len(actionable),
+                text=f"Drafting {i + 1}/{len(actionable)}: {subject[:60]}…",
+            )
+            try:
+                draft = draft_reply(thread)
+                st.session_state.drafts[thread_id] = draft
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"**{subject}**: {exc}")
+                st.session_state.drafts[thread_id] = (
+                    f"[Draft failed: {exc}]"
+                )
+
+        progress_bar.progress(1.0, text="Done ✓")
+
+        if errors:
+            st.error("Some drafts failed:\n" + "\n".join(f"- {e}" for e in errors))
+        else:
+            st.success(
+                f"All {len(actionable)} draft(s) generated — "
+                "review below, then head to **Approval Gate**."
+            )
+        st.rerun()
+
+    # ---------------------------------------------------------------------------
+    # Display draft cards
+    # ---------------------------------------------------------------------------
+    drafts: dict[str, str] = st.session_state.drafts
+
+    if not drafts:
+        st.info("Click **Generate All Drafts** to create drafts for the threads above.")
+        return
+
+    st.divider()
+    st.subheader(f"Drafts ({len(drafts)})")
+
+    for thread in actionable:
+        thread_id = thread.get("id", "")
+        subject = thread.get("subject", "(no subject)")
+        priority = thread.get("_priority", "needs-reply")
+        priority_badge = "🚨" if priority == "urgent" else "💬"
+
+        if thread_id not in drafts:
+            continue
+
+        with st.expander(f"{priority_badge} {subject}", expanded=False):
+            col_left, col_right = st.columns(2)
+
+            messages = thread.get("messages") or []
+            latest_msg = messages[-1] if messages else {}
+
+            with col_left:
+                st.markdown("**Original thread (latest message)**")
+                st.caption(
+                    f"From: {latest_msg.get('from', 'Unknown')}  •  "
+                    f"{latest_msg.get('date', '')}"
+                )
+                st.write(latest_msg.get("body", "_(no body)_"))
+                if len(messages) > 1:
+                    st.caption(f"_{len(messages)} message(s) in thread_")
+
+            with col_right:
+                st.markdown("**AI-generated draft**")
+                draft_text = drafts[thread_id]
+                st.text_area(
+                    label="Draft",
+                    value=draft_text,
+                    height=220,
+                    key=f"draft_text_{thread_id}",
+                    label_visibility="collapsed",
+                )
+                st.caption(f"{len(draft_text)} chars · Thread ID: `{thread_id}`")
+
+    st.divider()
+    st.success("✅ Drafts ready → go to **Approval Gate**")
+
+
+# ---------------------------------------------------------------------------
+# Phase: Approval Gate
+# ---------------------------------------------------------------------------
+def _actionable_threads_by_id() -> dict[str, dict[str, Any]]:
+    """Return a {thread_id: thread} map for urgent + needs-reply threads."""
+    triaged: dict[str, list[dict[str, Any]]] = st.session_state.triaged or {}
+    actionable = triaged.get("urgent", []) + triaged.get("needs-reply", [])
+    return {t.get("id", f"t_{i}"): t for i, t in enumerate(actionable)}
+
+
+def render_approval_phase() -> None:
+    st.header("✅ Approval Gate")
+    st.write(
+        "Review each AI draft. Approve (optionally edited), regenerate, or reject. "
+        "Nothing moves to Export until you explicitly approve it."
+    )
+
+    # ---- Pipeline execution log ----
+    pipeline_log: list[str] = st.session_state.pipeline_log or []
+    if pipeline_log:
+        with st.expander("🗒️ Pipeline Execution Log", expanded=False):
+            for entry in pipeline_log:
+                upper = entry.upper()
+                if "ERROR" in upper or "FAILED" in upper:
+                    st.write(f"❌ {entry}")
+                else:
+                    st.write(f"✅ {entry}")
+            if st.button("Clear log", key="clear_pipeline_log"):
                 st.session_state.pipeline_log = []
                 st.rerun()
         st.divider()
 
-    if not st.session_state.drafts:
-        st.warning("No drafts have been generated yet! Please go to 'Draft Generation' and create some.")
-    else:
-        # Load actionable threads that have drafts
-        drafted_threads = [
-            t for t in st.session_state.triaged
-            if t.get("id") in st.session_state.drafts
-        ]
-        
-        if not drafted_threads:
-            st.info("No active drafts found.")
+    drafts: dict[str, str] = st.session_state.drafts
+    approved: dict[str, str] = st.session_state.approved
+    rejected: set[str] = st.session_state.rejected
+    sent: set[str] = st.session_state.sent
+    booked: dict[str, dict] = st.session_state.booked
+
+    if not drafts:
+        st.warning(
+            "No drafts to review yet. "
+            "Go back to **Draft Generation** and generate drafts first."
+        )
+        return
+
+    threads_by_id = _actionable_threads_by_id()
+
+    # Running totals banner
+    pending_ids = [
+        tid for tid in drafts
+        if tid not in approved and tid not in rejected
+    ]
+    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+    col_stat1.metric("Total drafts", len(drafts))
+    col_stat2.metric("✅ Approved", len(approved))
+    col_stat3.metric("❌ Rejected", len(rejected))
+    col_stat4.metric("⏳ Pending", len(pending_ids))
+
+    st.divider()
+
+    all_reviewed = len(pending_ids) == 0
+
+    # ---- Iterate over every draft in insertion order ----
+    for thread_id, original_draft in drafts.items():
+        thread = threads_by_id.get(thread_id, {})
+        subject = thread.get("subject", thread_id)
+        messages = thread.get("messages") or []
+        priority = thread.get("_priority", "needs-reply")
+        badge = "🚨" if priority == "urgent" else "💬"
+
+        is_approved = thread_id in approved
+        is_rejected = thread_id in rejected
+        is_sent = thread_id in sent
+
+        if is_sent:
+            status_label = "📤 Sent"
+            expanded = False
+        elif is_approved:
+            status_label = "✅ Approved"
+            expanded = False
+        elif is_rejected:
+            status_label = "❌ Rejected"
+            expanded = False
         else:
-            # Dropdown to select which draft to review
-            thread_options = {t["subject"]: t["id"] for t in drafted_threads}
-            selected_subject = st.selectbox(
-                "Select Draft to Review:",
-                options=list(thread_options.keys())
-            )
-            
-            selected_tid = thread_options[selected_subject]
-            current_thread = next(t for t in drafted_threads if t["id"] == selected_tid)
-            first_msg = current_thread["messages"][0] if current_thread["messages"] else {}
-            
+            status_label = "⏳ Pending review"
+            expanded = True  # open pending items by default
+
+        with st.expander(
+            f"{badge} {subject}  —  {status_label}", expanded=expanded
+        ):
             col_left, col_right = st.columns(2)
-            
-            # Left: Thread History
+
+            # ---- Left: full thread ----
             with col_left:
-                st.subheader("📬 Thread History")
-                st.markdown(f"**Subject:** {current_thread.get('subject')}")
-                st.markdown(f"**From:** {first_msg.get('from')}")
-                st.markdown(
-                    f'<span class="metadata-badge badge-priority-{current_thread.get("priority").replace(" ", "-")}">Priority: {current_thread.get("priority").upper()}</span>'
-                    f'<span class="metadata-badge badge-category">Category: {current_thread.get("category").upper()}</span>',
-                    unsafe_allow_html=True
-                )
-                st.markdown(f"*Triage Reason:* {current_thread.get('reason')}")
-                st.write("---")
-                
-                # Messages history
-                for m in current_thread.get("messages", []):
+                st.markdown("**Email thread**")
+                for i, msg in enumerate(messages, start=1):
                     st.markdown(
-                        f"""
-                        <div class="thread-box">
-                            <span class="thread-sender">{m.get('from')}</span>
-                            <span class="thread-date">{m.get('date')}</span>
-                            <div class="thread-body">{m.get('body')}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
+                        f"**{i}. {msg.get('from', '?')}** · {msg.get('date', '')}"
                     )
-                    
-            # Right: Draft & Actions
+                    st.write(msg.get("body", "_(no body)_"))
+                    if i < len(messages):
+                        st.divider()
+
+            # ---- Right: editable draft + action buttons ----
             with col_right:
-                st.subheader("🤖 Draft Review")
-                
-                draft_text = st.session_state.drafts[selected_tid]
-                
-                # Check status
-                is_approved = selected_tid in st.session_state.approved
-                is_rejected = selected_tid in st.session_state.rejected
-                is_sent = selected_tid in st.session_state.sent
+                st.markdown("**Draft reply**")
 
-                # Retrieve from approved details if approved
-                if is_approved:
+                # Use approved text if already approved, else the draft
+                display_text = approved.get(thread_id, original_draft)
+
+                edited = st.text_area(
+                    label="draft",
+                    value=display_text,
+                    height=260,
+                    key=f"approval_text_{thread_id}",
+                    label_visibility="collapsed",
+                    disabled=is_approved or is_rejected,
+                )
+
+                if not is_approved and not is_rejected:
+                    btn_a, btn_b, btn_c = st.columns(3)
+
+                    with btn_a:
+                        if st.button(
+                            "✅ Approve",
+                            key=f"approve_{thread_id}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            final = (edited or "").strip() or original_draft
+                            st.session_state.approved[thread_id] = final
+                            st.rerun()
+
+                    with btn_b:
+                        if st.button(
+                            "🔄 Regenerate",
+                            key=f"regen_{thread_id}",
+                            use_container_width=True,
+                        ):
+                            draft_reply = _get_draft_reply()
+                            with st.spinner("Regenerating…"):
+                                try:
+                                    new_draft = draft_reply(thread)
+                                    st.session_state.drafts[thread_id] = new_draft
+                                    # Clear any prior rejection so it shows as pending
+                                    st.session_state.rejected.discard(thread_id)
+                                    st.session_state.approved.pop(thread_id, None)
+                                except Exception as exc:  # noqa: BLE001
+                                    st.error(f"Regeneration failed: {exc}")
+                            st.rerun()
+
+                    with btn_c:
+                        if st.button(
+                            "❌ Reject",
+                            key=f"reject_{thread_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.rejected.add(thread_id)
+                            st.rerun()
+
+                elif is_approved:
                     if is_sent:
-                        st.markdown(
-                            '<div class="status-approved">📤 Sent</div>',
-                            unsafe_allow_html=True
-                        )
+                        st.success("📤 Sent successfully.")
                     else:
-                        st.markdown(
-                            '<div class="status-approved">✅ This draft has been Approved!</div>',
-                            unsafe_allow_html=True
-                        )
-                    approved_draft_body = st.session_state.approved[selected_tid]["draft"]
-                    st.markdown(
-                        f'<div class="draft-container">{approved_draft_body}</div>',
-                        unsafe_allow_html=True
-                    )
+                        st.success("Approved — ready to send or export.")
+                        # Extract recipient e-mail from last message "from" field,
+                        # handling both "Name <email@host>" and bare "email@host".
+                        last_from = (messages[-1].get("from", "") if messages else "")
+                        if "<" in last_from and ">" in last_from:
+                            recipient = last_from.split("<", 1)[1].rstrip(">").strip()
+                        else:
+                            recipient = last_from.strip()
 
-                    if not is_sent:
-                        is_meeting = current_thread.get("category", "").lower() == "meeting"
-                        is_booked = selected_tid in st.session_state.booked
+                        is_meeting = thread.get("_category", "") == "meeting-request"
+                        is_booked = thread_id in st.session_state.booked
 
-                        # Debug: show the raw category and session state keys so mismatches are visible
-                        st.caption(
-                            f"🔍 Debug — category: `{current_thread.get('category', '(none)')}` | "
-                            f"is_meeting: `{is_meeting}` | is_booked: `{is_booked}` | "
-                            f"session keys: `{list(st.session_state.keys())}`"
-                        )
-
-                        # Calendar engine import check
-                        try:
-                            cal = _get_calendar_engine()
-                            _cal_ok = True
-                        except Exception as _cal_err:
-                            _cal_ok = False
-                            st.error(f"⚠️ calendar_engine import failed: {_cal_err}")
-
-                        # If already booked, show the calendar link in place of the button
-                        if is_booked:
-                            event_link = st.session_state.booked[selected_tid].get("htmlLink", "")
-                            st.success(
-                                "📅 Meeting booked!"
-                                + (f" [Open in Calendar]({event_link})" if event_link else "")
+                        if is_meeting and is_booked:
+                            event = st.session_state.booked[thread_id]
+                            cal_link = event.get("htmlLink", "")
+                            st.info(
+                                f"📅 Meeting booked."
+                                + (f"  [Open in Calendar]({cal_link})" if cal_link else "")
                             )
 
-                        # Button row: two-column for meeting threads, single for others
-                        if is_meeting and not is_booked:
-                            _bcol1, _bcol2 = st.columns(2)
-                            with _bcol1:
-                                _send_clicked = st.button(
-                                    "📤 Send Reply",
-                                    key=f"send_{selected_tid}",
-                                    type="primary",
-                                    use_container_width=True,
-                                )
-                            with _bcol2:
-                                _book_clicked = st.button(
-                                    "📅 Book Meeting",
-                                    key=f"book_{selected_tid}",
-                                    use_container_width=True,
-                                    disabled=not _cal_ok,
-                                )
+                        # --- action buttons ---
+                        if is_meeting:
+                            send_col, book_col = st.columns(2)
                         else:
-                            _send_clicked = st.button(
-                                "📤 Send Reply",
-                                key=f"send_{selected_tid}",
+                            send_col, _ = st.columns([1, 2])
+
+                        with send_col:
+                            if st.button(
+                                "📤 Send",
+                                key=f"send_{thread_id}",
                                 type="primary",
                                 use_container_width=True,
-                            )
-                            _book_clicked = False
+                                disabled=not recipient,
+                            ):
+                                send_reply = _get_send_reply()
+                                draft_body = approved[thread_id]
+                                with st.spinner(f"Sending to {recipient}……"):
+                                    try:
+                                        result = send_reply(
+                                            thread_id=thread_id,
+                                            to=recipient,
+                                            subject=thread.get("subject", ""),
+                                            body=draft_body,
+                                        )
+                                        st.session_state.sent.add(thread_id)
+                                        st.success(f"Sent to {recipient}.")
+                                        print(result)
+                                        if result.get("thread_id"):
+                                            log_action(
+                                                action_type="sent",
+                                                thread_subject=thread.get("subject", ""),
+                                                detail=recipient,
+                                                action_id=result["thread_id"],
+                                            )
+                                    except Exception as exc:  # noqa: BLE001
+                                        st.error(f"Send failed: {exc}")
+                                st.rerun()
 
-                        # Send handler
-                        if _send_clicked:
-                            import re as _re
-                            raw_from = first_msg.get("from", "")
-                            _match = _re.search(r"<(.+?)>", raw_from)
-                            recipient = _match.group(1).strip() if _match else raw_from.strip()
-                            try:
-                                send_fn = _get_send_reply()
-                                result = send_fn(
-                                    thread_id=selected_tid,
-                                    to=recipient,
-                                    subject=current_thread.get("subject", ""),
-                                    body=approved_draft_body,
-                                )
-                                st.session_state.sent.add(selected_tid)
-                                st.success(f"Reply sent to {recipient}!")
-                                if result and result.get("id"):
-                                    log_action(
-                                        action_type="sent",
-                                        thread_subject=current_thread["subject"],
-                                        detail=recipient,
-                                        action_id=result["id"],
+                        if is_meeting and not is_booked:
+                            # Show any error from the previous booking attempt
+                            # (stored in session state so it survives reruns).
+                            book_err_key = f"_book_error_{thread_id}"
+                            if st.session_state.get(book_err_key):
+                                st.error(st.session_state[book_err_key])
+                                if st.button(
+                                    "Dismiss",
+                                    key=f"dismiss_book_err_{thread_id}",
+                                ):
+                                    st.session_state[book_err_key] = None
+                                    st.rerun()
+
+                            with book_col:
+                                if st.button(
+                                    "📅 Book Meeting",
+                                    key=f"book_{thread_id}",
+                                    use_container_width=True,
+                                ):
+                                    parse_meeting_request, find_free_slot, create_event = (
+                                        _get_calendar_engine()
                                     )
-                                st.rerun()
-                            except Exception as _e:
-                                st.error(f"Failed to send: {_e}")
+                                    # Clear any previous error before this attempt.
+                                    st.session_state[book_err_key] = None
 
-                        # Book Meeting handler
-                        if _book_clicked and _cal_ok:
-                            with st.spinner("Extracting meeting details…"):
-                                try:
-                                    parsed = cal.parse_meeting_request(current_thread)
-                                except Exception as _e:
-                                    parsed = {"parsing_error": str(_e)}
-
-                            # Guard: result must be a dict
-                            if not isinstance(parsed, dict):
-                                st.error(
-                                    f"Could not parse meeting details: unexpected type "
-                                    f"{type(parsed).__name__} returned (expected dict). "
-                                    f"Raw value: {str(parsed)[:200]}"
-                                )
-                            elif "parsing_error" in parsed:
-                                st.error(parsed['parsing_error'])
-                            else:
-                                _proposed  = parsed.get("proposed_times", [])
-                                _duration  = parsed.get("duration_minutes", 30)
-                                _attendees = parsed.get("attendees", [])
-                                _topic     = parsed.get("topic") or current_thread.get("subject", "Meeting")
-
-                                st.info(
-                                    f"**Topic:** {_topic}  \n"
-                                    f"**Proposed times:** {', '.join(_proposed) if _proposed else 'none found'}  \n"
-                                    f"**Attendees:** {', '.join(_attendees) if _attendees else 'none found'}  \n"
-                                    f"**Duration:** {_duration} min"
-                                )
-
-                                if not _proposed:
-                                    st.warning("No proposed times found in the thread — cannot book.")
-                                else:
-                                    _free_slot = None
-                                    _avail_error = False
-                                    with st.spinner("Checking calendar availability…"):
+                                    # Fetch the full thread body on demand — the
+                                    # session_state copy only has a short snippet.
+                                    # Fall back to the cached thread if fetch fails.
+                                    with st.spinner("Fetching full email body…"):
                                         try:
-                                            _free_slot = cal.find_free_slot(_proposed, _duration)
-                                        except Exception as _e:
-                                            _avail_error = True
-                                            st.error(f"Availability check failed: {_e}")
+                                            fetch_full_thread = _get_fetch_full_thread()
+                                            full_thread = fetch_full_thread(thread_id)
+                                        except Exception:  # noqa: BLE001
+                                            full_thread = thread  # best-effort fallback
 
-                                    if not _avail_error and _free_slot is None:
-                                        st.warning("No free slot found among the proposed times.")
-                                    elif _free_slot is not None:
-                                        with st.spinner(f"Booking at {_free_slot}…"):
-                                            try:
-                                                _event = cal.create_event(
-                                                    summary=_topic,
-                                                    start_time=_free_slot,
-                                                    duration_minutes=_duration,
-                                                    attendees=_attendees,
-                                                    description=approved_draft_body,
+                                    with st.spinner("Parsing meeting details…"):
+                                        meeting = parse_meeting_request(full_thread)
+
+                                    if "parsing_error" in meeting:
+                                        st.session_state[book_err_key] = (
+                                            f"Could not parse meeting details: "
+                                            f"{meeting['parsing_error']}"
+                                        )
+                                        st.rerun()
+                                    else:
+                                        proposed = meeting.get("proposed_times", [])
+                                        duration = meeting.get("duration_minutes", 30)
+                                        topic = meeting.get("topic", thread.get("subject", ""))
+                                        invitees = meeting.get("attendees", [])
+
+                                        st.info(
+                                            f"**Topic:** {topic}  \n"
+                                            f"**Duration:** {duration} min  \n"
+                                            f"**Proposed times:** "
+                                            + (", ".join(proposed) if proposed else "_none found_")
+                                            + f"  \n**Attendees:** "
+                                            + (", ".join(invitees) if invitees else "_none found_")
+                                        )
+
+                                        if not proposed:
+                                            st.session_state[book_err_key] = (
+                                                "No proposed times found in the thread — "
+                                                "cannot check availability."
+                                            )
+                                            st.rerun()
+                                        else:
+                                            with st.spinner("Checking calendar availability…"):
+                                                free_slot = find_free_slot(proposed, duration)
+
+                                            if free_slot is None:
+                                                st.session_state[book_err_key] = (
+                                                    "None of the proposed times are free. "
+                                                    "Reply to suggest alternatives."
                                                 )
-                                                st.session_state.booked[selected_tid] = _event
-                                                _link = _event.get("htmlLink", "")
-                                                st.success(
-                                                    f"Meeting booked for {_free_slot}!"
-                                                    + (f" [Open in Calendar]({_link})" if _link else "")
-                                                )
-                                                if _event.get("id"):
-                                                    log_action(
-                                                        action_type="booked",
-                                                        thread_subject=current_thread["subject"],
-                                                        detail=_topic,
-                                                        action_id=_event["id"],
-                                                    )
                                                 st.rerun()
-                                            except Exception as _e:
-                                                st.error(f"Failed to create event: {_e}")
-                elif is_rejected:
-                    st.markdown('<div class="status-rejected">❌ This draft was Rejected. Go to Draft Generation to recreate.</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div style="opacity: 0.5;" class="draft-container">{draft_text}</div>', unsafe_allow_html=True)
-                else:
-                    # Editing mode toggle inside session state
-                    edit_key = f"editing_mode_{selected_tid}"
-                    if edit_key not in st.session_state:
-                        st.session_state[edit_key] = False
-                        
-                    if st.session_state[edit_key]:
-                        st.markdown("📝 **Editing Draft**")
-                        edited_text = st.text_area(
-                            "Modify reply text:",
-                            value=draft_text,
-                            height=250
-                        )
-                        
-                        btn_s1, btn_s2 = st.columns(2)
-                        with btn_s1:
-                            if st.button("💾 Save & Approve", type="primary", use_container_width=True):
-                                # Save to approved dict
-                                st.session_state.approved[selected_tid] = {
-                                    "thread_id": selected_tid,
-                                    "subject": current_thread.get("subject"),
-                                    "sender": first_msg.get("from"),
-                                    "draft": edited_text,
-                                    "approved_at": datetime.now().isoformat(),
-                                    "edited": True
-                                }
-                                st.session_state.drafts[selected_tid] = edited_text
-                                st.session_state[edit_key] = False
-                                st.success("Draft approved successfully!")
-                                st.rerun()
-                        with btn_s2:
-                            if st.button("Cancel", use_container_width=True):
-                                st.session_state[edit_key] = False
-                                st.rerun()
-                    else:
-                        st.markdown(f'<div class="draft-container">{draft_text}</div>', unsafe_allow_html=True)
-                        
-                        # Action buttons
-                        col_b1, col_b2, col_b3 = st.columns(3)
-                        with col_b1:
-                            if st.button("👍 APPROVE", use_container_width=True, type="primary"):
-                                st.session_state.approved[selected_tid] = {
-                                    "thread_id": selected_tid,
-                                    "subject": current_thread.get("subject"),
-                                    "sender": first_msg.get("from"),
-                                    "draft": draft_text,
-                                    "approved_at": datetime.now().isoformat(),
-                                    "edited": False
-                                }
-                                st.success("Draft approved!")
-                                st.rerun()
-                        with col_b2:
-                            if st.button("📝 EDIT", use_container_width=True):
-                                st.session_state[edit_key] = True
-                                st.rerun()
-                        with col_b3:
-                            if st.button("👎 REJECT", use_container_width=True):
-                                st.session_state.rejected.add(selected_tid)
-                                # Remove from approved if it was there
-                                if selected_tid in st.session_state.approved:
-                                    del st.session_state.approved[selected_tid]
-                                st.rerun()
+                                            else:
+                                                with st.spinner(f"Booking {free_slot}…"):
+                                                    try:
+                                                        event = create_event(
+                                                            summary=topic,
+                                                            start_time=free_slot,
+                                                            duration_minutes=duration,
+                                                            attendees=invitees,
+                                                            description=approved.get(thread_id, ""),
+                                                        )
+                                                        st.session_state.booked[thread_id] = event
+                                                        # Success — rerun to show the
+                                                        # booked state (link replaces button).
+                                                        print(event)
+                                                        if event.get("id"):
+                                                            log_action(
+                                                                action_type="booked",
+                                                                thread_subject=thread.get("subject", ""),
+                                                                detail=topic,
+                                                                action_id=event["id"],
+                                                            )
+                                                        st.rerun()
+                                                    except Exception as exc:  # noqa: BLE001
+                                                        st.session_state[book_err_key] = (
+                                                            f"Booking failed: {exc}"
+                                                        )
+                                                        st.rerun()
 
-# ==========================================
-def generate_proof_markdown():
-    lines = []
-    lines.append("# The Draft Desk – Proof of Work")
+                        if not recipient:
+                            st.caption("⚠️ No recipient address found — cannot send.")
+                else:
+                    st.error("Rejected — regenerate to try again.")
+
+    # ---- All-reviewed state ----
+    st.divider()
+    if all_reviewed:
+        if approved:
+            st.balloons()
+            st.success(
+                f"🎉 All {len(drafts)} draft(s) reviewed — "
+                f"**{len(approved)}** approved · **{len(rejected)}** rejected · "
+                f"**{len(sent)}** sent · **{len(booked)}** booked. "
+                "Head to **Export Proof** to download your session proof."
+            )
+        else:
+            st.info("All drafts reviewed but none were approved.")
+    elif pending_ids:
+        st.info(f"**{len(pending_ids)}** draft(s) still need review.")
+
+
+# ---------------------------------------------------------------------------
+# Phase: Export Proof
+# ---------------------------------------------------------------------------
+def _quote_thread(messages: list[dict[str, Any]]) -> str:
+    """Format all thread messages as a plain-text quoted block."""
+    lines: list[str] = []
+    for msg in messages:
+        lines.append(f"From: {msg.get('from', '?')}")
+        lines.append(f"Date: {msg.get('date', '?')}")
+        lines.append("")
+        for body_line in (msg.get("body") or "").splitlines():
+            lines.append(f"    {body_line}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def generate_proof_markdown(
+    approved: dict[str, str],
+    threads_by_id: dict[str, dict[str, Any]],
+) -> str:
+    """Build a Markdown proof document for all approved drafts."""
+    from datetime import datetime  # local import — already in stdlib
+
+    lines: list[str] = []
+    lines.append("# Draft Desk — Session Proof")
     lines.append("")
-    lines.append(f"*Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}*")
+    lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"**Approved drafts:** {len(approved)}")
     lines.append("")
-    for tid, approved_data in st.session_state.approved.items():
-        thread = next((t for t in st.session_state.triaged if t.get("id") == tid), {})
-        messages = thread.get("messages", [])
-        lines.append(f"## Thread: {approved_data.get('subject', 'No Subject')}")
-        for msg in messages:
-            lines.append(f"> **{msg.get('from', 'unknown')}** ({msg.get('date', 'unknown')}): {msg.get('body', '')}")
+    lines.append("---")
+    lines.append("")
+
+    for i, (thread_id, draft_text) in enumerate(approved.items(), start=1):
+        thread = threads_by_id.get(thread_id, {})
+        subject = thread.get("subject", thread_id)
+        messages = thread.get("messages") or []
+
+        lines.append(f"## {i}. {subject}")
+        lines.append("")
+        lines.append("### Original thread")
         lines.append("")
         lines.append("```")
-        lines.append(approved_data.get('draft', ''))
+        lines.append(_quote_thread(messages))
         lines.append("```")
         lines.append("")
+        lines.append("### Approved draft")
+        lines.append("")
+        lines.append("```")
+        lines.append(draft_text)
+        lines.append("```")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
     return "\n".join(lines)
 
-def generate_proof_html():
-    html = """
-    <html>
-    <head>
+
+def generate_proof_html(
+    approved: dict[str, str],
+    threads_by_id: dict[str, dict[str, Any]],
+) -> str:
+    """Build a styled dark-theme HTML proof document for all approved drafts."""
+    from datetime import datetime  # local import
+
+    def _esc(s: str) -> str:
+        """Minimal HTML escaping."""
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+        )
+
+    css = """
     <style>
-    body {
-        background-color: #1a1a2e;
-        color: #e0e0e0;
-        font-family: Arial, sans-serif;
-        margin: 20px;
-    }
-    .grid-container {
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #0e1117;
+        color: #e6edf3;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        padding: 32px;
+        line-height: 1.6;
+      }
+      h1 { font-size: 1.8em; margin-bottom: 4px; }
+      h2 { font-size: 1.3em; margin: 40px 0 16px; }
+      .meta { color: #8b949e; font-size: 0.9em; margin-bottom: 24px; }
+      .thread-block {
+        margin-bottom: 40px;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .thread-header {
+        background: #161b22;
+        padding: 12px 20px;
+        font-weight: 700;
+        font-size: 1.05em;
+        border-bottom: 1px solid #30363d;
+      }
+      .thread-index {
+        color: #8b949e;
+        font-weight: 400;
+        margin-right: 8px;
+      }
+      .cols {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 20px;
-        margin-top: 20px;
-    }
-    .thread-box {
-        border: 2px solid #ff6600;
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #162447;
-    }
-    .draft-box {
-        border: 2px solid #28a745;
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #1f4068;
-    }
-    blockquote {
-        margin: 0;
-        padding-left: 10px;
-        border-left: 4px solid #ff6600;
-        color: #e0e0e0;
-    }
-    pre {
-        background-color: #2d2d44;
-        padding: 10px;
-        border-radius: 5px;
-        overflow-x: auto;
-    }
+        gap: 0;
+      }
+      .col-original {
+        padding: 20px;
+        border-right: 1px solid #30363d;
+        border-left: 4px solid #e6722e;
+      }
+      .col-draft {
+        padding: 20px;
+        border-left: 4px solid #3fb950;
+      }
+      .col-label {
+        font-size: 0.78em;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #8b949e;
+        margin-bottom: 12px;
+      }
+      .col-original .col-label { color: #e6722e; }
+      .col-draft   .col-label { color: #3fb950; }
+      .message-block {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        padding: 10px 14px;
+        margin-bottom: 10px;
+      }
+      .msg-meta { font-size: 0.82em; color: #8b949e; margin-bottom: 6px; }
+      .msg-sender { color: #58a6ff; font-weight: 600; }
+      .msg-body { white-space: pre-wrap; font-size: 0.9em; }
+      .draft-body {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        padding: 12px 16px;
+        white-space: pre-wrap;
+        font-size: 0.9em;
+      }
+      /* Action log table */
+      .action-log {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9em;
+        margin-top: 8px;
+      }
+      .action-log th {
+        text-align: left;
+        padding: 8px 14px;
+        background: #161b22;
+        color: #8b949e;
+        font-size: 0.78em;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        border-bottom: 1px solid #30363d;
+      }
+      .action-log td {
+        padding: 10px 14px;
+        border-bottom: 1px solid #21262d;
+        vertical-align: middle;
+      }
+      .action-log tr:last-child td { border-bottom: none; }
+      .action-log tr:hover td { background: #161b22; }
+      .badge-sent {
+        display: inline-block;
+        background: #1f6feb22;
+        color: #58a6ff;
+        border: 1px solid #1f6feb55;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 20px;
+        font-size: 0.82em;
+      }
+      .badge-booked {
+        display: inline-block;
+        background: #3fb95022;
+        color: #3fb950;
+        border: 1px solid #3fb95055;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 20px;
+        font-size: 0.82em;
+      }
+      .log-detail { font-family: monospace; font-size: 0.88em; color: #8b949e; }
+      .log-ts { color: #8b949e; font-size: 0.84em; white-space: nowrap; }
+      .no-actions { color: #8b949e; font-style: italic; padding: 16px 0; }
+      .footer {
+        margin-top: 48px;
+        padding-top: 20px;
+        border-top: 1px solid #30363d;
+        color: #8b949e;
+        font-size: 0.88em;
+        text-align: center;
+      }
+      .badge {
+        display: inline-block;
+        background: #1f6feb;
+        color: #e6edf3;
+        font-weight: 700;
+        padding: 2px 10px;
+        border-radius: 20px;
+        font-size: 0.85em;
+        margin-left: 8px;
+      }
+      @media (max-width: 700px) {
+        .cols { grid-template-columns: 1fr; }
+        .col-original { border-right: none; border-bottom: 1px solid #30363d; }
+      }
     </style>
-    </head>
-    <body>
-    <h1>The Draft Desk – Proof of Work</h1>
-    <p><em>Generated on """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z") + """</em></p>
     """
-    for tid, approved_data in st.session_state.approved.items():
-        thread = next((t for t in st.session_state.triaged if t.get("id") == tid), {})
-        messages = thread.get("messages", [])
-        html += "<div class='grid-container'>"
-        html += "<div class='thread-box'>"
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ---- Draft blocks ----
+    blocks: list[str] = []
+    for i, (thread_id, draft_text) in enumerate(approved.items(), start=1):
+        thread = threads_by_id.get(thread_id, {})
+        subject = _esc(thread.get("subject", thread_id))
+        messages = thread.get("messages") or []
+
+        # Build message HTML for the left column
+        msg_html_parts: list[str] = []
         for msg in messages:
-            html += f"<blockquote><strong>{msg.get('from', 'unknown')}</strong> ({msg.get('date', 'unknown')}): {msg.get('body', '')}</blockquote>"
-        html += "</div>"
-        html += "<div class='draft-box'>"
-        html += f"<pre><code>{approved_data.get('draft', '')}</code></pre>"
-        html += "</div>"
-        html += "</div>"
-    html += "</body></html>"
-    return html
-# Phase 4: Export Proof
-# ==========================================
-if st.session_state.current_phase == "Export Proof":
-    st.title("📤 Export Proof")
-    st.write("Export and save approved draft replies. Approved drafts are recorded in `approved_drafts.json` with timestamps.")
-    
-    if not st.session_state.approved:
-        st.warning("No drafts have been approved yet! Go to 'Approval Gate' to authorize drafts.")
+            sender = _esc(msg.get("from", "?"))
+            date = _esc(msg.get("date", ""))
+            body = _esc((msg.get("body") or "").strip())
+            msg_html_parts.append(
+                f'<div class="message-block">'
+                f'  <div class="msg-meta">'
+                f'    <span class="msg-sender">{sender}</span> &middot; {date}'
+                f'  </div>'
+                f'  <div class="msg-body">{body}</div>'
+                f'</div>'
+            )
+
+        draft_escaped = _esc(draft_text)
+
+        blocks.append(f"""
+<div class="thread-block">
+  <div class="thread-header">
+    <span class="thread-index">#{i}</span>{subject}
+  </div>
+  <div class="cols">
+    <div class="col-original">
+      <div class="col-label">Original thread</div>
+      {"".join(msg_html_parts)}
+    </div>
+    <div class="col-draft">
+      <div class="col-label">Approved draft</div>
+      <div class="draft-body">{draft_escaped}</div>
+    </div>
+  </div>
+</div>""")
+
+    # ---- Action log section ----
+    action_log = get_action_log()
+
+    if not action_log:
+        action_log_html = '<p class="no-actions">No actions logged in this session.</p>'
     else:
-        st.subheader(f"Approved Drafts ready to be queued ({len(st.session_state.approved)})")
-        
-        # Side-by-side preview of all approved drafts
-        for tid, approved_data in list(st.session_state.approved.items()):
-            thread = next((t for t in st.session_state.triaged if t.get("id") == tid), {})
-            messages = thread.get("messages", [])
-            col_orig, col_draft = st.columns(2)
-            with col_orig:
-                st.markdown("**📬 Original Thread**")
-                for msg in messages:
-                    st.markdown(
-                        f"""
-                        <div class="thread-box" style="border-left: 4px solid #ff6600;">
-                            <span class="thread-sender">{msg.get('from', 'unknown')}</span>
-                            <span class="thread-date">{msg.get('date', 'unknown')}</span>
-                            <div class="thread-body">{msg.get('body', '')}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-            with col_draft:
-                st.markdown("**🤖 Approved Draft**")
-                st.markdown(
-                    f"""
-                    <div class="draft-container" style="border-color: #4caf50;">
-                    {approved_data.get('draft')}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            # Undo approval action
-            if st.button("↩️ Revoke Approval", key=f"revoke_{tid}"):
-                del st.session_state.approved[tid]
-                st.info("Approval revoked.")
-                st.rerun()
-            st.write("---")
-        
-        # Download proof buttons
-        md_content = generate_proof_markdown()
-        html_content = generate_proof_html()
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                label="📄 Download Proof (Markdown)",
-                data=md_content,
-                file_name="proof_of_work.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-        with dl2:
-            st.download_button(
-                label="🌐 Download Proof (HTML)",
-                data=html_content,
-                file_name="proof_of_work.html",
-                mime="text/html",
-                use_container_width=True
-            )
-                
-        # Export button
-        if st.button("💾 Export All Approved Drafts to File", type="primary", use_container_width=True):
+        rows: list[str] = []
+        for entry in action_log:
+            a_type = entry.get("action_type", "")
+            icon = "📨" if a_type == "sent" else "📅"
+            badge_cls = "badge-sent" if a_type == "sent" else "badge-booked"
+
+            # Format timestamp
+            raw_ts = entry.get("timestamp", "")
             try:
-                # Load current database list
-                if os.path.exists("approved_drafts.json"):
-                    with open("approved_drafts.json", "r", encoding="utf-8") as f:
-                        all_approved_records = json.load(f)
-                else:
-                    all_approved_records = []
-                
-                # Append active session's newly approved drafts (prevent duplicating same thread approvals)
-                existing_ids = {rec.get("thread_id") for rec in all_approved_records}
-                added_count = 0
-                for tid, app_data in st.session_state.approved.items():
-                    if tid not in existing_ids:
-                        all_approved_records.append(app_data)
-                        added_count += 1
-                        
-                with open("approved_drafts.json", "w", encoding="utf-8") as f:
-                    json.dump(all_approved_records, f, indent=4)
-                    
-                st.success(f"Successfully exported {added_count} new approvals to `approved_drafts.json` (Total records: {len(all_approved_records)})!")
-            except Exception as e:
-                st.error(f"Error saving to approved_drafts.json: {e}")
+                from datetime import timezone as _tz
+                parse_ts = raw_ts.replace("Z", "+00:00") if raw_ts.endswith("Z") else raw_ts
+                dt = datetime.fromisoformat(parse_ts)
+                fmt_ts = dt.strftime("%b %d, %Y %I:%M %p")
+            except (ValueError, AttributeError):
+                fmt_ts = raw_ts
 
-        # ── Action Log ────────────────────────────────────────────────────────
-        st.write("---")
-        st.subheader("Action Log")
+            rows.append(
+                f'<tr>'
+                f'<td><span class="{badge_cls}">{icon} {_esc(a_type.upper())}</span></td>'
+                f'<td>{_esc(entry.get("thread_subject", ""))}</td>'
+                f'<td class="log-detail">{_esc(entry.get("detail", ""))}</td>'
+                f'<td class="log-ts">{_esc(fmt_ts)}</td>'
+                f'</tr>'
+            )
 
-        _action_entries = get_action_log()
+        action_log_html = f"""
+<table class="action-log">
+  <thead>
+    <tr>
+      <th>Action</th>
+      <th>Thread</th>
+      <th>Detail</th>
+      <th>Timestamp</th>
+    </tr>
+  </thead>
+  <tbody>
+    {"".join(rows)}
+  </tbody>
+</table>"""
 
-        if not _action_entries:
-            st.info("No actions logged yet.")
-        else:
-            for _entry in _action_entries:
-                _atype = _entry.get("action_type", "")
-                _icon  = "📨" if _atype == "sent" else "📅"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Draft Desk — Session Proof</title>
+  {css}
+</head>
+<body>
+  <h1>✍️ Draft Desk — Session Proof</h1>
+  <div class="meta">
+    Generated {now_str} &nbsp;·&nbsp;
+    {len(approved)} approved draft(s)
+  </div>
+  {"".join(blocks)}
+  <h2>📋 Action Log</h2>
+  {action_log_html}
+  <div class="footer">
+    Share with <strong>#MyAIChiefOfStaff</strong> to earn your
+    <span class="badge">Ghostwriter</span> badge!
+  </div>
+</body>
+</html>"""
+    return html
 
-                # Parse ISO timestamp → "Jan 01 02:30 PM"
-                try:
-                    from datetime import timezone as _tz
-                    _ts_raw = _entry.get("timestamp", "")
-                    _dt = datetime.fromisoformat(_ts_raw)
-                    # Convert to local time if the timestamp carries UTC info
-                    if _dt.tzinfo is not None:
-                        _dt = _dt.astimezone().replace(tzinfo=None)
-                    _ts_display = _dt.strftime("%b %d %I:%M %p")
-                except Exception:
-                    _ts_display = _entry.get("timestamp", "")
 
-                _c1, _c2, _c3, _c4 = st.columns([1, 3, 3, 2])
-                with _c1:
-                    st.write(f"{_icon} **{_atype.upper()}**")
-                with _c2:
-                    st.write(f"**{_entry.get('thread_subject', '')}**")
-                with _c3:
-                    st.write(f"`{_entry.get('detail', '')}`")
-                with _c4:
-                    st.caption(_ts_display)
+def render_export_phase() -> None:
+    st.header("📤 Export Proof")
+    st.write(
+        "Preview all approved drafts side-by-side with their original threads, "
+        "then download your session proof in Markdown or HTML."
+    )
+
+    approved: dict[str, str] = st.session_state.approved
+    threads_by_id = _actionable_threads_by_id()
+
+    if not approved:
+        st.warning(
+            "No approved drafts yet. "
+            "Go to **Approval Gate** and approve at least one draft first."
+        )
+        return
+
+    st.caption(f"{len(approved)} approved draft(s) ready to export.")
+
+    # ---- Preview cards (side-by-side) ----
+    st.subheader("Preview")
+    for thread_id, draft_text in approved.items():
+        thread = threads_by_id.get(thread_id, {})
+        subject = thread.get("subject", thread_id)
+        messages = thread.get("messages") or []
+        latest = messages[-1] if messages else {}
+
+        with st.expander(f"✅ {subject}", expanded=True):
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.markdown("**Original thread**")
+                for i, msg in enumerate(messages, start=1):
+                    st.markdown(
+                        f"**{i}. {msg.get('from', '?')}** · {msg.get('date', '')}"
+                    )
+                    st.write(msg.get("body", "_(no body)_"))
+                    if i < len(messages):
+                        st.divider()
+
+            with col_right:
+                st.markdown("**Approved draft**")
+                st.code(draft_text, language=None)
+
+    # ---- Generate & download ----
+    st.divider()
+    st.subheader("Download")
+
+    md_content = generate_proof_markdown(approved, threads_by_id)
+    html_content = generate_proof_html(approved, threads_by_id)
+
+    from datetime import datetime as _dt
+    timestamp = _dt.now().strftime("%Y%m%d_%H%M")
+
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="⬇️ Download Proof (Markdown)",
+            data=md_content,
+            file_name=f"draft_proof_{timestamp}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+    with dl_col2:
+        st.download_button(
+            label="⬇️ Download Proof (HTML)",
+            data=html_content,
+            file_name=f"draft_proof_{timestamp}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.info(
+        "Share with **#MyAIChiefOfStaff** to earn your **Ghostwriter** badge! 🏅"
+    )
+
+    # ---- Action Log ----
+    st.divider()
+    st.subheader("Action Log")
+
+    action_log = get_action_log()
+
+    if not action_log:
+        st.info("No actions logged yet.")
+    else:
+        for entry in action_log:
+            a_type = entry.get("action_type", "")
+            icon = "📨" if a_type == "sent" else "📅"
+
+            # Parse and reformat the timestamp — e.g. "Jan 01 02:30 PM"
+            raw_ts = entry.get("timestamp", "")
+            try:
+                from datetime import datetime, timezone as _tz
+                # Handle both +00:00 offset and trailing Z
+                parse_ts = raw_ts.replace("Z", "+00:00") if raw_ts.endswith("Z") else raw_ts
+                dt = datetime.fromisoformat(parse_ts)
+                formatted_ts = dt.strftime("%b %d %I:%M %p")
+            except (ValueError, AttributeError):
+                formatted_ts = raw_ts
+
+            col1, col2, col3, col4 = st.columns([1, 3, 3, 2])
+            with col1:
+                st.write(f"{icon} **{a_type.upper()}**")
+            with col2:
+                st.write(f"**{entry.get('thread_subject', '')}**")
+            with col3:
+                st.write(f"`{entry.get('detail', '')}`")
+            with col4:
+                st.caption(formatted_ts)
+
+
+# ---------------------------------------------------------------------------
+# Phase dispatch
+# ---------------------------------------------------------------------------
+def render_phase(phase: str) -> None:
+    if phase == "Inbox and Triage":
+        render_inbox_phase()
+    elif phase == "Draft Generation":
+        render_draft_phase()
+    elif phase == "Approval Gate":
+        render_approval_phase()
+    elif phase == "Export Proof":
+        render_export_phase()
+    else:
+        st.warning(f"Unknown phase: {phase}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    render_sidebar()
+    if st.session_state.pipeline_running:
+        _render_pipeline_execution()
+    else:
+        render_phase(st.session_state.current_phase)
+
+
+if __name__ == "__main__":
+    main()

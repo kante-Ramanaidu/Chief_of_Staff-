@@ -1,247 +1,336 @@
 """
-Context Builder Module for Email Reply Drafting Agent
+context_builder.py
+==================
 
-Assembles the full prompt context (Layers 1-3) for an email reply drafting
-agent, using REAL data pulled from Gmail plus your persona profile:
+Assembles the full prompt context for an email reply drafting agent.
 
-  Layer 1 - Thread History   -> engine.get_thread_history()
-  Layer 2 - Persona / Tone   -> persona.json
-  Layer 3 - Past Replies     -> engine.get_past_replies() (few-shot examples)
+The agent drafts replies in the voice of a specific person (defined in
+``tone_profile.json``), using a small set of past replies
+(``past_replies.json``) as few-shot examples.
 
-The actual AI call (sending this context to Gemini to generate a draft)
-is intentionally NOT included here — that's next sprint. This module only
-builds the prompt string.
+Public API
+----------
+- ``load_tone_profile(path)``         -> dict
+- ``load_past_replies(path)``         -> list
+- ``format_thread_history(thread)``   -> str
+- ``build_system_prompt(tone, past)`` -> str
+- ``build_user_prompt(thread_str)``   -> str
+- ``assemble_context(thread)``        -> {"system": str, "user": str}
 """
 
+from __future__ import annotations
+
 import json
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from engine import get_thread_history, get_past_replies
-
-PERSONA_PATH = "persona.json"
+from pathlib import Path
+from typing import Any
 
 
-@dataclass
-class EmailContext:
-    """Structured context for a single email thread."""
-    thread_id: str
-    sender: str
-    subject: str
-    snippet: str
-    date: str
-    priority: str
-    category: str
-    reason: str
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
 
+def load_tone_profile(path: str | Path = "tone_profile.json") -> dict[str, Any]:
+    """Load the tone profile JSON file and return it as a dict.
 
-# Priority-based response guidelines
-PRIORITY_GUIDELINES = {
-    "urgent": {
-        "response_time": "within 2-4 hours",
-        "tone": "direct and action-oriented",
-        "description": "This email requires immediate attention. Respond quickly with clear action items."
-    },
-    "needs reply": {
-        "response_time": "within 24 hours",
-        "tone": "thoughtful and complete",
-        "description": "This email expects a response. Take time to craft a thorough reply."
-    },
-    "fyi": {
-        "response_time": "optional",
-        "tone": "acknowledgment if needed",
-        "description": "This is informational. Reply only if you have valuable input or need to acknowledge receipt."
-    },
-    "ignore": {
-        "response_time": "none",
-        "tone": "no response needed",
-        "description": "This email can be safely ignored or archived without response."
-    }
-}
+    Parameters
+    ----------
+    path : str | Path
+        Path to the tone profile JSON file. Defaults to
+        ``tone_profile.json`` in the current working directory.
 
-# Category-specific guidelines
-CATEGORY_GUIDELINES = {
-    "meeting": {"key_elements": ["availability", "agenda", "confirmation"], "tone": "cooperative and clear"},
-    "project": {"key_elements": ["status update", "next steps", "blockers"], "tone": "collaborative and informative"},
-    "personal": {"key_elements": ["empathy", "personal touch"], "tone": "warm and genuine"},
-    "social": {"key_elements": ["enthusiasm", "accept/decline"], "tone": "friendly and engaging"},
-    "spam": {"key_elements": ["none"], "tone": "no response"},
-    "followup": {"key_elements": ["status", "commitments", "next actions"], "tone": "accountable and transparent"},
-    "newsletter": {"key_elements": ["none"], "tone": "no response needed"},
-    "jobapp": {"key_elements": ["professionalism", "gratitude", "next steps"], "tone": "professional and enthusiastic"},
-    "support": {"key_elements": ["issue details", "urgency"], "tone": "clear and factual"},
-    "finance": {"key_elements": ["verification", "deadline"], "tone": "cautious and thorough"},
-    "other": {"key_elements": ["context", "clarity"], "tone": "professional and clear"},
-}
-
-
-def load_persona(path: str = PERSONA_PATH) -> Dict[str, Any]:
+    Returns
+    -------
+    dict
+        The parsed tone profile.
     """
-    Layer 2 - Loads your real tone/persona profile from persona.json.
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_past_replies(path: str | Path = "past_replies.json") -> list[dict[str, Any]]:
+    """Load the past replies JSON file and return it as a list of examples.
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to the past replies JSON file. Defaults to
+        ``past_replies.json`` in the current working directory.
+
+    Returns
+    -------
+    list[dict]
+        A list of past reply example dicts.
     """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # Safe fallback so the pipeline doesn't crash if persona.json is missing
-        return {
-            "name": "User",
-            "tone": "professional",
-            "sentence_length": "medium",
-            "greeting_style": "Hi [Name],",
-            "sign_off": "Best,",
-            "quirks": []
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"{path} should contain a JSON list of replies.")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Thread formatting
+# ---------------------------------------------------------------------------
+
+def format_thread_history(thread: dict[str, Any]) -> str:
+    """Format a Gmail-style email thread as a readable plain-text string.
+
+    The ``thread`` dict is expected to have::
+
+        {
+            "subject": "Some subject",
+            "messages": [
+                {"from": "Alice <a@x.com>", "date": "2026-06-14 09:00", "body": "..."},
+                ...
+            ]
         }
 
+    Parameters
+    ----------
+    thread : dict
+        Thread dict with ``subject`` and ``messages``.
 
-def _format_persona_block(persona: Dict[str, Any]) -> str:
-    lines = [
-        f"You are drafting this email as: {persona.get('name', 'User')}",
-        f"Tone: {persona.get('tone', 'professional')}",
-        f"Formality: {persona.get('formality', 'semi-formal')}",
-        f"Sentence length: {persona.get('sentence_length', 'medium')}",
-        f"Greeting style: {persona.get('greeting_style', 'Hi [Name],')}",
-        f"Sign-off: {persona.get('sign_off', 'Best,')}",
-    ]
-    quirks = persona.get("quirks", [])
-    if quirks:
-        lines.append("Writing quirks to follow:")
-        for q in quirks:
-            lines.append(f"  - {q}")
-    return "\n".join(lines)
-
-
-def _format_thread_history_block(history: List[Dict[str, str]]) -> str:
+    Returns
+    -------
+    str
+        A formatted, human-readable string representation of the thread.
     """
-    Layer 1 - Formats the full back-and-forth of a thread into readable text.
-    """
-    if not history:
-        return "(No prior message history available for this thread.)"
+    if "subject" not in thread or "messages" not in thread:
+        raise ValueError("thread must contain 'subject' and 'messages' keys")
 
-    lines = []
-    for msg in history:
-        lines.append(f"From: {msg.get('sender', 'Unknown')} ({msg.get('date', 'Unknown date')})")
-        lines.append(msg.get("content", "").strip())
+    subject = thread["subject"]
+    messages = thread["messages"]
+
+    lines: list[str] = []
+    lines.append(f"Subject: {subject}")
+    lines.append(f"Messages: {len(messages)}")
+    lines.append("=" * 60)
+    lines.append("")
+
+    for idx, msg in enumerate(messages, start=1):
+        sender = msg.get("from", "(unknown sender)")
+        date = msg.get("date", "(unknown date)")
+        body = (msg.get("body") or "").strip()
+
+        lines.append(f"[Message {idx}]")
+        lines.append(f"From: {sender}")
+        lines.append(f"Date: {date}")
         lines.append("-" * 40)
-    return "\n".join(lines)
+        lines.append(body)
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
-def _format_past_replies_block(replies: List[Dict[str, str]]) -> str:
-    """
-    Layer 3 - Formats 2-3 of your real sent replies as few-shot examples.
-    """
-    if not replies:
-        return "(No past reply examples available.)"
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
 
-    lines = []
-    for i, r in enumerate(replies, 1):
-        lines.append(f"Example {i} — Subject: {r.get('subject', '')}")
-        lines.append(r.get("content", "").strip())
-        lines.append("-" * 40)
-    return "\n".join(lines)
+def _persona_block(tone_profile: dict[str, Any]) -> str:
+    """Build the persona section of the system prompt."""
+    name = tone_profile.get("name", "the user")
+    role = tone_profile.get("role", "")
+    company = tone_profile.get("company", "")
+    tone = tone_profile.get("tone", "")
+    voice = tone_profile.get("voice_description", "").strip()
+    traits = tone_profile.get("traits", [])
+    do_list = tone_profile.get("do", [])
+    dont_list = tone_profile.get("dont", [])
+    signature = tone_profile.get("signature", "").strip()
 
-
-def build_reply_context(thread: Dict[str, Any], num_examples: int = 3) -> str:
-    """
-    Assembles the FULL prompt context for drafting a reply to one thread,
-    combining all 3 layers:
-
-        Layer 1: real thread history (fetched live from Gmail)
-        Layer 2: your persona/tone profile (persona.json)
-        Layer 3: 2-3 of your real past sent replies (fetched live from Gmail)
-
-    Args:
-        thread: a triaged thread dict (thread_id, sender, subject, snippet,
-                date, priority, category, reason)
-        num_examples: how many past sent replies to pull as few-shot examples
-
-    Returns:
-        A single formatted prompt string, ready to be sent to an LLM
-        in a future sprint.
-    """
-    email_ctx = EmailContext(
-        thread_id=thread.get("thread_id", ""),
-        sender=thread.get("sender", ""),
-        subject=thread.get("subject", ""),
-        snippet=thread.get("snippet", ""),
-        date=thread.get("date", ""),
-        priority=thread.get("priority", "unknown"),
-        category=thread.get("category", "other"),
-        reason=thread.get("reason", "")
+    parts: list[str] = []
+    parts.append("You are an email reply drafting assistant.")
+    parts.append(
+        f"You write on behalf of {name}"
+        + (f", {role}" if role else "")
+        + (f" at {company}" if company else "")
+        + "."
     )
+    parts.append(f"The overall tone should be: {tone}.")
 
-    priority_guide = PRIORITY_GUIDELINES.get(email_ctx.priority, PRIORITY_GUIDELINES["needs reply"])
-    category_guide = CATEGORY_GUIDELINES.get(email_ctx.category, CATEGORY_GUIDELINES["other"])
+    if voice:
+        parts.append("")
+        parts.append("Voice description:")
+        parts.append(voice)
 
-    persona = load_persona()
+    if traits:
+        parts.append("")
+        parts.append("Traits:")
+        for t in traits:
+            parts.append(f"- {t}")
 
-    # Layer 1: pull real thread history from Gmail
-    thread_history = get_thread_history(email_ctx.thread_id) if email_ctx.thread_id else []
+    if do_list:
+        parts.append("")
+        parts.append("Do:")
+        for item in do_list:
+            parts.append(f"- {item}")
 
-    # Layer 3: pull real past sent replies from Gmail
-    past_replies = get_past_replies(limit=num_examples)
+    if dont_list:
+        parts.append("")
+        parts.append("Don't:")
+        for item in dont_list:
+            parts.append(f"- {item}")
 
-    parts = []
+    if signature:
+        parts.append("")
+        parts.append("Default signature to use:")
+        parts.append(signature)
 
-    parts.append("=" * 70)
-    parts.append("EMAIL REPLY DRAFTING ASSISTANT")
-    parts.append("=" * 70)
+    return "\n".join(parts).strip()
+
+
+def _few_shot_block(past_replies: list[dict[str, Any]]) -> str:
+    """Build the few-shot examples block of the system prompt."""
+    if not past_replies:
+        return "No past reply examples are available. Match the voice description above."
+
+    parts: list[str] = []
+    parts.append("Below are real past replies written by this person. "
+                 "Match their style, structure, and tone closely.")
     parts.append("")
 
-    parts.append("-" * 70)
-    parts.append("LAYER 2: YOUR TONE / PERSONA")
-    parts.append("-" * 70)
-    parts.append(_format_persona_block(persona))
-    parts.append("")
+    for i, ex in enumerate(past_replies, start=1):
+        ctx = ex.get("context", "").strip()
+        subject = ex.get("incoming_subject", "").strip()
+        reply = (ex.get("reply") or "").strip()
 
-    parts.append("-" * 70)
-    parts.append("LAYER 3: EXAMPLES OF YOUR REAL PAST REPLIES (write like these)")
-    parts.append("-" * 70)
-    parts.append(_format_past_replies_block(past_replies))
-    parts.append("")
+        parts.append(f"--- Example {i} ---")
+        if ctx:
+            parts.append(f"Context: {ctx}")
+        if subject:
+            parts.append(f"Incoming subject: {subject}")
+        parts.append("Reply:")
+        parts.append(reply)
+        parts.append("")
 
-    parts.append("-" * 70)
-    parts.append("EMAIL CLASSIFICATION")
-    parts.append("-" * 70)
-    parts.append(f"Priority: {email_ctx.priority.upper()}")
-    parts.append(f"Category: {email_ctx.category}")
-    parts.append(f"Reason: {email_ctx.reason}")
-    parts.append(f"Recommended tone for this category: {category_guide['tone']}")
-    parts.append(f"Key elements to include: {', '.join(category_guide['key_elements'])}")
-    parts.append(f"Response urgency: {priority_guide['response_time']}")
-    parts.append("")
+    return "\n".join(parts).rstrip()
 
-    parts.append("-" * 70)
-    parts.append("LAYER 1: FULL THREAD HISTORY")
-    parts.append("-" * 70)
-    parts.append(_format_thread_history_block(thread_history))
-    parts.append("")
 
-    parts.append("-" * 70)
-    parts.append("TASK")
-    parts.append("-" * 70)
-    parts.append("Draft a reply to the most recent message in this thread.")
-    parts.append("Write in the exact tone/style described in LAYER 2, using the")
-    parts.append("examples in LAYER 3 as a guide for real voice and phrasing.")
-    parts.append("Address the content from LAYER 1 directly.")
-    parts.append("=" * 70)
+def build_system_prompt(
+    tone_profile: dict[str, Any],
+    past_replies: list[dict[str, Any]],
+) -> str:
+    """Build the system prompt: persona + few-shot examples.
 
-    return "\n".join(parts)
+    Parameters
+    ----------
+    tone_profile : dict
+        Parsed tone profile (see ``load_tone_profile``).
+    past_replies : list[dict]
+        Parsed past replies (see ``load_past_replies``).
 
+    Returns
+    -------
+    str
+        The complete system prompt.
+    """
+    persona = _persona_block(tone_profile)
+    few_shot = _few_shot_block(past_replies)
+
+    system_prompt = (
+        f"{persona}\n\n"
+        "Your job: read the incoming email thread and draft a reply that "
+        "sounds exactly like the person described above. Do not add commentary, "
+        "preamble, or explanations - output ONLY the email body, ready to send.\n\n"
+        f"{few_shot}"
+    )
+    return system_prompt
+
+
+def build_user_prompt(thread_formatted: str) -> str:
+    """Build the user message that asks the model to draft a reply.
+
+    Parameters
+    ----------
+    thread_formatted : str
+        Output of ``format_thread_history``.
+
+    Returns
+    -------
+    str
+        The user prompt string.
+    """
+    instructions = (
+        "Here is the email thread that needs a reply. "
+        "Draft a reply in the voice described in the system prompt.\n\n"
+        "Requirements:\n"
+        "- Match the tone, length, and structure of the past examples.\n"
+        "- Be concise. Prefer short paragraphs.\n"
+        "- Open with a brief, warm acknowledgment.\n"
+        "- Close with a clear next step or question, and the appropriate sign-off.\n"
+        "- Do not include any commentary - output ONLY the email body.\n\n"
+        "--- THREAD START ---\n"
+    )
+    closing = "\n--- THREAD END ---\n\nDraft the reply now:"
+    return f"{instructions}{thread_formatted}{closing}"
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry point
+# ---------------------------------------------------------------------------
+
+def assemble_context(thread: dict[str, Any]) -> dict[str, str]:
+    """Build the full prompt context (system + user) for a given thread.
+
+    This loads the tone profile and past replies from their default
+    locations (``tone_profile.json`` and ``past_replies.json``) in the
+    current working directory, then assembles both prompts.
+
+    Parameters
+    ----------
+    thread : dict
+        Thread dict with ``subject`` and ``messages``.
+
+    Returns
+    -------
+    dict
+        ``{"system": <system prompt>, "user": <user prompt>}``
+    """
+    tone_profile = load_tone_profile()
+    past_replies = load_past_replies()
+    thread_str = format_thread_history(thread)
+
+    system_prompt = build_system_prompt(tone_profile, past_replies)
+    user_prompt = build_user_prompt(thread_str)
+
+    return {"system": system_prompt, "user": user_prompt}
+
+
+# ---------------------------------------------------------------------------
+# Demo / CLI entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Quick manual test using a fake triaged thread + real Gmail data
+    # A sample thread to demonstrate the end-to-end pipeline.
     sample_thread = {
-        "thread_id": "19f46e12b6ee984f",
-        "sender": "boss@company.com",
-        "subject": "Quick question about the Q3 deck",
-        "snippet": "Do you have the latest version?",
-        "date": "2026-07-08",
-        "priority": "needs reply",
-        "category": "project",
-        "reason": "Colleague needs information to proceed with work"
+        "subject": "Q3 Roadmap Review - need your input by Friday",
+        "messages": [
+            {
+                "from": "Elena Park <elena.park@acme.com>",
+                "date": "2026-06-12 10:42",
+                "body": (
+                    "Hi Rahul,\n\n"
+                    "Hope your week's going well. I'm putting together the Q3 review "
+                    "deck and would love a short paragraph from you on the Onboarding "
+                    "rewrite. Specifically: status, biggest risk, and what you need "
+                    "from leadership to land it.\n\n"
+                    "Could you send something by EOD Friday? Even 4-5 lines is fine.\n\n"
+                    "Thanks!\nElena"
+                ),
+            },
+        ],
     }
 
-    print("NOTE: replace thread_id above with a real one from fetch_threads() to test Layer 1 fully.\n")
-    context = build_reply_context(sample_thread)
-    print(context)
+    context = assemble_context(sample_thread)
+
+    print("=" * 70)
+    print("ASSEMBLED PROMPT CONTEXT")
+    print("=" * 70)
+    print()
+    print("--- SYSTEM PROMPT ---")
+    print(context["system"])
+    print()
+    print("--- USER PROMPT ---")
+    print(context["user"])

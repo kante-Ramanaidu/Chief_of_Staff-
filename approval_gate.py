@@ -1,426 +1,767 @@
-import os
+"""
+approval_gate.py
+================
+
+Streamlit-based "Human-in-the-Loop" approval gate for the AI email ghostwriter.
+
+This is the safety layer that sits between the AI draft and the real world.
+No email is ever sent (or even queued to send) without an explicit human
+APPROVE click. The human can also EDIT the draft or REJECT it and ask for a
+regeneration.
+
+Architecture
+------------
+    [Email thread] -> context_builder (prompts)
+                  -> draft_machine   (Gemini draft)
+                  -> approval_gate   <-- YOU ARE HERE (human gate)
+                  -> approved_drafts.json  (only after APPROVE)
+
+Run with:
+    streamlit run approval_gate.py
+"""
+
+from __future__ import annotations
+
 import json
-from datetime import datetime
-import streamlit as st
-from google import genai
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Environment / .env loading  (must run before importing draft_machine)
+# ---------------------------------------------------------------------------
 from dotenv import load_dotenv
 
-# Import context builder and draft machine modules
-import context_builder
-import draft_machine
-import engine
-from draft_machine import SAMPLE_THREADS, draft_reply
+_HERE = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=_HERE / ".env")
+load_dotenv()  # also try CWD
 
-# Load environment variables
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Third-party imports
+# ---------------------------------------------------------------------------
+import streamlit as st
 
-# Set up Streamlit page config
+# Local project imports. These are in the same directory as this file.
+# Add the script's directory to sys.path so `import context_builder` and
+# `import draft_machine` work no matter how Streamlit is launched.
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import context_builder  # noqa: E402
+import draft_machine    # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+APPROVED_DRAFTS_PATH = _HERE / "approved_drafts.json"
+
+# Three sample email threads for the dropdown. They cover a mix of common
+# real-world situations: a cross-functional ask, a customer bug, and a
+# launch-date check-in.
+SAMPLE_THREADS: dict[str, dict[str, Any]] = {
+    "Q3 Roadmap Review - need your input by Friday": {
+        "subject": "Q3 Roadmap Review - need your input by Friday",
+        "messages": [
+            {
+                "from": "Elena Park <elena.park@acme.com>",
+                "date": "2026-06-12 10:42",
+                "body": (
+                    "Hi Rahul,\n\n"
+                    "Hope your week's going well. I'm putting together the Q3 review "
+                    "deck and would love a short paragraph from you on the Onboarding "
+                    "rewrite. Specifically: status, biggest risk, and what you need "
+                    "from leadership to land it.\n\n"
+                    "Could you send something by EOD Friday? Even 4-5 lines is fine.\n\n"
+                    "Thanks!\nElena"
+                ),
+            },
+        ],
+    },
+    "Dashboard keeps timing out": {
+        "subject": "Dashboard keeps timing out",
+        "messages": [
+            {
+                "from": "Marcus Lee <marcus.lee@customer.example.com>",
+                "date": "2026-06-13 14:08",
+                "body": (
+                    "Hi support team,\n\n"
+                    "The analytics dashboard has been timing out for me every time I "
+                    "try to load the 'Last 30 days' view. It's been happening for the "
+                    "last two days. I have an exec review tomorrow morning and really "
+                    "need this working.\n\n"
+                    "Can someone take a look?\n\n"
+                    "Thanks,\nMarcus"
+                ),
+            },
+        ],
+    },
+    "Nov launch - is Nov 12 realistic?": {
+        "subject": "Nov launch - is Nov 12 realistic?",
+        "messages": [
+            {
+                "from": "Sam Rivera <sam.rivera@acme.com>",
+                "date": "2026-06-13 17:55",
+                "body": (
+                    "Hey Rahul,\n\n"
+                    "Marketing is asking if we can hold Nov 12 for the v2 launch. "
+                    "Honest read on whether that's realistic, or whether we should "
+                    "pull the date? They'd rather know now than scramble later.\n\n"
+                    "Thanks,\nSam"
+                ),
+            },
+        ],
+    },
+}
+
+THREAD_OPTIONS = ["-- Select a sample thread --"] + list(SAMPLE_THREADS.keys())
+
+
+# ---------------------------------------------------------------------------
+# Streamlit page config (must be the first Streamlit call)
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
-    page_title="AI Email Reply Approval Gate",
+    page_title="Approval Gate - AI Email Ghostwriter",
+    page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling for Dark Theme & Nice Elements
-st.markdown(
-    """
-    <style>
-    /* Dark Theme background */
+
+# ---------------------------------------------------------------------------
+# Custom CSS - dark theme + status colors
+# ---------------------------------------------------------------------------
+
+CUSTOM_CSS = """
+<style>
+    /* ---- Base dark theme tweaks ---- */
     .stApp {
-        background-color: #1a1a2e;
-        color: #e0e0e0;
+        background-color: #0e1117;
     }
-    
-    /* Sidebar styling */
     section[data-testid="stSidebar"] {
-        background-color: #161625 !important;
-        border-right: 1px solid #2d2d44;
+        background-color: #161b22;
     }
-    
-    /* Thread boxes */
-    .thread-box {
-        background-color: #162447;
-        border: 1px solid #1f4068;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 12px;
+
+    /* ---- Thread message boxes ---- */
+    .thread-message {
+        background-color: #1c2128;
+        border: 1px solid #30363d;
+        border-left: 4px solid #58a6ff;
+        border-radius: 6px;
+        padding: 12px 16px;
+        margin: 10px 0;
+        color: #e6edf3;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     }
-    
-    .thread-sender {
-        font-weight: bold;
-        color: #00bbee;
-        font-size: 0.95em;
+    .thread-message .msg-meta {
+        color: #8b949e;
+        font-size: 0.85em;
+        margin-bottom: 6px;
     }
-    
-    .thread-date {
-        font-size: 0.8em;
-        color: #8888aa;
-        float: right;
+    .thread-message .msg-meta .sender {
+        color: #58a6ff;
+        font-weight: 600;
     }
-    
-    .thread-body {
-        margin-top: 8px;
+    .thread-message .msg-body {
         white-space: pre-wrap;
-        font-size: 0.9em;
-        color: #e0e0e0;
-    }
-    
-    /* Draft Display */
-    .draft-container {
-        background-color: #1f4068;
-        border: 2px solid #00bbee;
-        border-radius: 8px;
-        padding: 20px;
-        margin-bottom: 20px;
-        font-size: 1.05em;
         line-height: 1.5;
+    }
+    .thread-subject {
+        background-color: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 12px;
+        color: #f0f6fc;
+        font-weight: 600;
+    }
+
+    /* ---- Draft display ---- */
+    .draft-box {
+        background-color: #0d1117;
+        border: 1px solid #30363d;
+        border-left: 4px solid #d29922;
+        border-radius: 6px;
+        padding: 16px 20px;
+        margin: 10px 0;
+        color: #e6edf3;
         white-space: pre-wrap;
-        color: #ffffff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        line-height: 1.55;
     }
-    
-    /* Status indicators */
+    .draft-meta {
+        color: #8b949e;
+        font-size: 0.85em;
+        margin-bottom: 10px;
+    }
+    .draft-meta .label {
+        color: #d29922;
+        font-weight: 600;
+    }
+
+    /* ---- Status banners ---- */
     .status-approved {
-        background-color: #1b5e20;
-        border: 1px solid #4caf50;
-        color: #e8f5e9;
-        padding: 12px;
-        border-radius: 5px;
-        font-weight: bold;
-        margin-bottom: 15px;
+        background-color: #033a16;
+        border: 1px solid #2ea043;
+        border-left: 6px solid #2ea043;
+        border-radius: 6px;
+        padding: 12px 18px;
+        color: #aff5b4;
+        font-weight: 600;
+        margin: 10px 0;
     }
-    
     .status-rejected {
-        background-color: #b71c1c;
-        border: 1px solid #f44336;
-        color: #ffebee;
-        padding: 12px;
-        border-radius: 5px;
-        font-weight: bold;
-        margin-bottom: 15px;
+        background-color: #3a0d0d;
+        border: 1px solid #f85149;
+        border-left: 6px solid #f85149;
+        border-radius: 6px;
+        padding: 12px 18px;
+        color: #ffb4b0;
+        font-weight: 600;
+        margin: 10px 0;
     }
-    
-    .metadata-badge {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.8em;
-        font-weight: bold;
-        margin-right: 5px;
-        margin-top: 5px;
+    .status-editing {
+        background-color: #3a2a05;
+        border: 1px solid #d29922;
+        border-left: 6px solid #d29922;
+        border-radius: 6px;
+        padding: 12px 18px;
+        color: #f0c674;
+        font-weight: 600;
+        margin: 10px 0;
     }
-    .badge-priority-urgent { background-color: #e94560; color: #fff; }
-    .badge-priority-needs-reply { background-color: #f0a500; color: #fff; }
-    .badge-priority-fyi { background-color: #0f4c75; color: #fff; }
-    .badge-category { background-color: #3282b8; color: #fff; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+    .status-info {
+        background-color: #0c2d6b;
+        border: 1px solid #1f6feb;
+        border-left: 6px solid #1f6feb;
+        border-radius: 6px;
+        padding: 12px 18px;
+        color: #b6d6ff;
+        margin: 10px 0;
+    }
 
-# --- Monkey-patch get_thread_history and get_past_replies to use mock data when running with Sample/Custom Threads ---
-def mock_get_thread_history(thread_id: str):
-    # Find in session state or default SAMPLE_THREADS
-    for t in SAMPLE_THREADS:
-        if t["thread_id"] == thread_id:
-            return t.get("history", [])
-    
-    # Check if we have a custom thread currently in session_state
-    if "custom_thread_data" in st.session_state and st.session_state.custom_thread_data:
-        if st.session_state.custom_thread_data.get("thread_id") == thread_id:
-            return st.session_state.custom_thread_data.get("history", [
-                {
-                    "sender": st.session_state.custom_thread_data.get("sender", "unknown"),
-                    "date": st.session_state.custom_thread_data.get("date", "unknown"),
-                    "content": st.session_state.custom_thread_data.get("snippet", "")
-                }
-            ])
-            
-    return []
+    /* ---- Header ---- */
+    .gate-header {
+        background: linear-gradient(90deg, #1f6feb 0%, #d29922 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-size: 1.8em;
+        font-weight: 700;
+        margin-bottom: 4px;
+    }
+    .gate-sub {
+        color: #8b949e;
+        font-size: 0.95em;
+        margin-bottom: 18px;
+    }
+</style>
+"""
 
-def mock_get_past_replies(limit: int = 3):
-    return [
-        {
-            "subject": "Re: Project proposal",
-            "content": "Let's proceed with the phase 1 rollout. I'll review the budget by tomorrow."
-        },
-        {
-            "subject": "Re: Meeting schedule",
-            "content": "Thanks for confirming. I'm available at 3 PM as proposed."
-        },
-        {
-            "subject": "Re: Quick Sync",
-            "content": "Sounds good. Let's touch base on Thursday afternoon."
-        }
-    ]
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Apply monkey patching so context_builder doesn't hit Gmail API during demo
-engine.get_thread_history = mock_get_thread_history
-engine.get_past_replies = mock_get_past_replies
-context_builder.get_thread_history = mock_get_thread_history
-context_builder.get_past_replies = mock_get_past_replies
 
-# --- State Management Initialization ---
-if "current_draft" not in st.session_state:
-    st.session_state.current_draft = None
-if "status" not in st.session_state:
-    st.session_state.status = "none" # "none", "approved", "editing", "rejected"
-if "generation_count" not in st.session_state:
-    st.session_state.generation_count = 0
-if "edited_draft_text" not in st.session_state:
-    st.session_state.edited_draft_text = ""
-if "selected_thread_id" not in st.session_state:
-    st.session_state.selected_thread_id = SAMPLE_THREADS[0]["thread_id"]
-if "custom_thread_json" not in st.session_state:
-    st.session_state.custom_thread_json = ""
-if "custom_thread_data" not in st.session_state:
-    st.session_state.custom_thread_data = None
+# ---------------------------------------------------------------------------
+# Session-state initialization
+# ---------------------------------------------------------------------------
 
-# --- API Key Management ---
-api_key = os.getenv("GEMINI_API_KEY")
+def _init_state() -> None:
+    """Initialize all session_state keys the app relies on."""
+    defaults: dict[str, Any] = {
+        "selected_thread": None,          # the thread currently picked
+        "draft_thread": None,             # the thread that produced current_draft
+        "current_draft": None,            # the latest generated draft body
+        "draft_meta": None,               # metadata from draft_machine
+        "status": "none",                 # none | approved | editing | rejected
+        "edit_buffer": "",                # working text in the EDIT text area
+        "generation_count": 0,            # how many drafts generated this session
+        "api_key_override": None,         # user-entered key (overrides env)
+        "last_error": None,               # last error from a failed generation
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
-st.sidebar.title("Configuration")
 
-if not api_key:
-    api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
-    if api_key_input:
-        api_key = api_key_input
-        # Update draft_machine and gemini client with user-provided key
-        os.environ["GEMINI_API_KEY"] = api_key
-        draft_machine.GEMINI_API_KEY = api_key
-        draft_machine.client = genai.Client(api_key=api_key)
+_init_state()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def render_thread_html(thread: dict[str, Any]) -> str:
+    """Build the HTML for a thread (subject + each message as a styled box)."""
+    subject = thread.get("subject", "(no subject)")
+    messages = thread.get("messages", []) or []
+
+    parts: list[str] = []
+    parts.append(f'<div class="thread-subject">📧 {subject}</div>')
+    for msg in messages:
+        sender = msg.get("from", "(unknown sender)")
+        date = msg.get("date", "(unknown date)")
+        body = (msg.get("body") or "").strip()
+        parts.append(
+            f'<div class="thread-message">'
+            f'  <div class="msg-meta">'
+            f'    <span class="sender">{sender}</span> &middot; {date}'
+            f'  </div>'
+            f'  <div class="msg-body">{body}</div>'
+            f'</div>'
+        )
+    return "\n".join(parts)
+
+
+def render_draft_html(draft: str, meta: dict[str, Any] | None = None) -> str:
+    """Build the HTML for the draft display box."""
+    parts: list[str] = []
+    if meta:
+        parts.append(
+            f'<div class="draft-meta">'
+            f'  <span class="label">Model:</span> {meta.get("model", "?")} '
+            f'&middot; '
+            f'  <span class="label">To:</span> {meta.get("reply_to", "?")} '
+            f'&middot; '
+            f'  <span class="label">Chars:</span> {meta.get("char_count", len(draft))}'
+            f'</div>'
+        )
+    parts.append(f'<div class="draft-box">{draft}</div>')
+    return "\n".join(parts)
+
+
+def save_approved_draft(
+    draft: str,
+    thread: dict[str, Any] | None,
+    meta: dict[str, Any] | None = None,
+    source: str = "ai",
+) -> None:
+    """Append an approved draft to approved_drafts.json (creates file if needed).
+
+    On-disk format: a JSON list of objects with timestamp, source,
+    thread_subject, reply_to, model, char_count, and draft body.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "source": source,
+        "thread_subject": (thread or {}).get("subject", ""),
+        "reply_to": (meta or {}).get("reply_to", ""),
+        "model": (meta or {}).get("model", ""),
+        "char_count": len(draft),
+        "draft": draft,
+    }
+
+    if APPROVED_DRAFTS_PATH.exists():
+        try:
+            with APPROVED_DRAFTS_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+        except (json.JSONDecodeError, OSError):
+            data = []
     else:
-        st.sidebar.warning("Please enter a Gemini API Key to proceed.")
-else:
-    # Key is present, make sure client is initialized
-    draft_machine.GEMINI_API_KEY = api_key
-    draft_machine.client = genai.Client(api_key=api_key)
+        data = []
 
-# --- Sidebar Selection ---
-st.sidebar.header("Thread Selection")
+    data.append(record)
 
-# Dropdown for sample threads
-thread_options = {t["subject"]: t["thread_id"] for t in SAMPLE_THREADS}
-selected_option = st.sidebar.selectbox(
-    "Select Sample Thread",
-    options=list(thread_options.keys()),
-    index=0
-)
+    with APPROVED_DRAFTS_PATH.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-active_thread_id = thread_options[selected_option]
 
-# Check if selected thread has changed to reset draft states if needed
-if active_thread_id != st.session_state.selected_thread_id:
-    st.session_state.selected_thread_id = active_thread_id
-    st.session_state.current_draft = None
-    st.session_state.status = "none"
-    st.session_state.generation_count = 0
+def try_parse_custom_thread(raw: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate a JSON string pasted by the user as a thread.
 
-# Custom Thread JSON Input
-st.sidebar.subheader("Or Paste Custom Thread JSON")
-custom_json = st.sidebar.text_area(
-    "Custom Thread JSON",
-    value=st.session_state.custom_thread_json,
-    height=200,
-    help="Paste thread JSON matching context_builder structure."
-)
-
-current_thread = None
-
-if custom_json:
+    Returns (thread, None) on success or (None, error_message) on failure.
+    """
+    if not raw.strip():
+        return None, "Paste a JSON thread first."
     try:
-        parsed_custom = json.loads(custom_json)
-        # Ensure it has thread_id or assign a generic one
-        if "thread_id" not in parsed_custom:
-            parsed_custom["thread_id"] = "custom_thread"
-        
-        st.session_state.custom_thread_data = parsed_custom
-        st.session_state.custom_thread_json = custom_json
-        current_thread = parsed_custom
-        st.sidebar.success("Custom thread parsed successfully!")
-    except json.JSONDecodeError:
-        st.sidebar.error("Invalid JSON format.")
-        current_thread = next(t for t in SAMPLE_THREADS if t["thread_id"] == active_thread_id)
-else:
-    st.session_state.custom_thread_data = None
-    st.session_state.custom_thread_json = ""
-    current_thread = next(t for t in SAMPLE_THREADS if t["thread_id"] == active_thread_id)
+        thread = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"Invalid JSON: {e}"
+    if not isinstance(thread, dict):
+        return None, "Thread must be a JSON object."
+    if "subject" not in thread or "messages" not in thread:
+        return None, "Thread must contain 'subject' and 'messages' keys."
+    if not isinstance(thread["messages"], list) or not thread["messages"]:
+        return None, "'messages' must be a non-empty list."
+    return thread, None
 
-# Generate Draft Button
-generate_clicked = st.sidebar.button("Generate Draft", use_container_width=True)
 
-if generate_clicked:
-    if not api_key:
-        st.sidebar.error("Gemini API Key is required to generate a draft!")
-    else:
-        with st.spinner("Generating AI reply draft..."):
-            try:
-                # Call draft generation
-                draft_text = draft_reply(current_thread)
-                st.session_state.current_draft = draft_text
-                st.session_state.status = "none"
-                st.session_state.generation_count += 1
-            except Exception as e:
-                st.error(f"Error generating draft: {e}")
+def resolve_api_key() -> str | None:
+    """Return the effective Gemini API key (override > env), or None."""
+    override = st.session_state.get("api_key_override")
+    if override:
+        return override
+    return os.getenv("GEMINI_API_KEY")
 
-# --- Main App Interface ---
-st.title("✍️ AI Email Ghostwriter - Approval Gate")
-st.write("Review, edit, and approve email reply drafts. **Human-in-the-loop: AI proposes, you authorize.**")
 
-col1, col2 = st.columns(2)
+def reset_draft_state() -> None:
+    """Clear the draft-related session state."""
+    st.session_state.current_draft = None
+    st.session_state.draft_meta = None
+    st.session_state.draft_thread = None
+    st.session_state.edit_buffer = ""
+    st.session_state.status = "none"
+    st.session_state.last_error = None
 
-# --- Left Column: Thread History ---
-with col1:
-    st.subheader("📬 Thread History")
-    
-    # Display details of the active thread
-    priority = current_thread.get("priority", "needs reply")
-    category = current_thread.get("category", "project")
-    reason = current_thread.get("reason", "No reason provided")
-    
-    st.markdown(f"**Subject:** {current_thread.get('subject', 'No Subject')}")
-    st.markdown(f"**To/From:** {current_thread.get('sender', 'Unknown')}")
-    
-    priority_class = f"badge-priority-{priority.replace(' ', '-')}"
-    st.markdown(
-        f'<span class="metadata-badge {priority_class}">Priority: {priority.upper()}</span>'
-        f'<span class="metadata-badge badge-category">Category: {category.upper()}</span>',
-        unsafe_allow_html=True
+
+# ---------------------------------------------------------------------------
+# Sidebar - thread selection + API key
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("### 🛡️ Approval Gate")
+    st.markdown("Human-in-the-loop review for the AI email ghostwriter.")
+    st.markdown("---")
+
+    st.markdown("#### 📥 Email thread")
+
+    choice = st.selectbox(
+        "Sample thread",
+        options=THREAD_OPTIONS,
+        index=0,
+        key="sample_choice",
     )
-    st.markdown(f"*Classification Reason: {reason}*")
-    st.write("---")
-    
-    # Thread history messages
-    history_messages = current_thread.get("history", [
-        {
-            "sender": current_thread.get("sender", "Unknown"),
-            "date": current_thread.get("date", "Unknown date"),
-            "content": current_thread.get("snippet", "(No snippet or body text)")
-        }
-    ])
-    
-    for msg in history_messages:
+
+    st.markdown("**Or paste your own thread JSON:**")
+    custom_json = st.text_area(
+        "Custom thread JSON",
+        value="",
+        height=180,
+        placeholder='{"subject": "...", "messages": [{"from": "...", "date": "...", "body": "..."}]}',
+        label_visibility="collapsed",
+    )
+
+    use_custom = st.checkbox("Use custom thread", value=False)
+
+    # Resolve the selected thread (custom takes precedence if checked).
+    selected_thread: dict[str, Any] | None = None
+    if use_custom:
+        parsed, err = try_parse_custom_thread(custom_json)
+        if err:
+            st.error(f"❌ {err}")
+        else:
+            selected_thread = parsed
+            st.success(f"✅ Loaded custom thread: {parsed.get('subject', '(no subject)')}")
+    elif choice and choice != THREAD_OPTIONS[0]:
+        selected_thread = SAMPLE_THREADS[choice]
+
+    st.session_state.selected_thread = selected_thread
+
+    st.markdown("---")
+    st.markdown("#### 🔑 API key")
+
+    env_key_present = bool(os.getenv("GEMINI_API_KEY"))
+    if env_key_present:
+        st.success("✅ GEMINI_API_KEY found in environment")
+    else:
+        st.warning("⚠️ GEMINI_API_KEY not set - paste it below or add to .env")
+
+    api_key_input = st.text_input(
+        "Gemini API key (override)",
+        value=st.session_state.get("api_key_override") or "",
+        type="password",
+        help="Leave blank to use the value from .env / environment.",
+    )
+    if api_key_input:
+        st.session_state.api_key_override = api_key_input
+    else:
+        st.session_state.api_key_override = None
+
+    effective_key = resolve_api_key()
+    if not effective_key:
+        st.error("❌ No API key available. Add one to .env or paste it above.")
+
+    st.markdown("---")
+    st.markdown("#### 🔁 Generate")
+    generate_clicked = st.button(
+        "✨ Generate Draft",
+        type="primary",
+        use_container_width=True,
+        disabled=(selected_thread is None) or (effective_key is None),
+    )
+
+    st.markdown("---")
+    st.markdown("#### 📊 Session stats")
+    st.markdown(f"- Drafts generated: **{st.session_state.generation_count}**")
+    st.markdown(f"- Current status: **{st.session_state.status}**")
+
+    if st.button("🔄 Reset session", use_container_width=True):
+        st.session_state.selected_thread = None
+        st.session_state.draft_thread = None
+        st.session_state.current_draft = None
+        st.session_state.draft_meta = None
+        st.session_state.status = "none"
+        st.session_state.edit_buffer = ""
+        st.session_state.generation_count = 0
+        st.session_state.last_error = None
+        st.success("Session reset.")
+
+
+# ---------------------------------------------------------------------------
+# Generation handler (runs when the Generate button is clicked)
+# ---------------------------------------------------------------------------
+
+if generate_clicked and selected_thread is not None and effective_key is not None:
+    # If a key override was set in the UI, push it into the environment so
+    # draft_machine picks it up (it reads GEMINI_API_KEY via os.getenv).
+    if st.session_state.get("api_key_override"):
+        os.environ["GEMINI_API_KEY"] = st.session_state.api_key_override
+
+    with st.spinner("🤖 Generating draft with Gemini..."):
+        try:
+            result = draft_machine.draft_reply_with_metadata(selected_thread)
+            st.session_state.current_draft = result["draft"]
+            st.session_state.draft_meta = result
+            st.session_state.draft_thread = selected_thread
+            st.session_state.status = "none"
+            st.session_state.edit_buffer = result["draft"]
+            st.session_state.generation_count += 1
+            st.session_state.last_error = None
+        except Exception as e:  # noqa: BLE001 - we want to surface any error
+            st.session_state.last_error = str(e)
+            st.session_state.current_draft = None
+            st.session_state.draft_meta = None
+            st.session_state.draft_thread = None
+            st.session_state.status = "none"
+
+
+# ---------------------------------------------------------------------------
+# Main area - header
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    '<div class="gate-header">🛡️ Human-in-the-Loop Approval Gate</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="gate-sub">'
+    'Review the AI-generated draft below, then <b>APPROVE</b>, <b>EDIT</b>, or '
+    '<b>REJECT</b> it. Nothing is sent without your explicit approval.'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+if st.session_state.last_error:
+    st.markdown(
+        f'<div class="status-rejected">❌ Generation failed: '
+        f'{st.session_state.last_error}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Two-column layout: thread (left) | draft (right)
+# ---------------------------------------------------------------------------
+
+# Pick which thread to show. Prefer the thread that produced the current
+# draft; fall back to the user's current selection.
+display_thread = st.session_state.draft_thread or st.session_state.selected_thread
+
+_cols = st.columns([1, 1], gap="large")
+left_col, right_col = _cols[0], _cols[1]
+
+with left_col:
+    st.markdown("#### 📥 Email thread")
+    if display_thread:
+        st.markdown(render_thread_html(display_thread), unsafe_allow_html=True)
+    else:
         st.markdown(
-            f"""
-            <div class="thread-box">
-                <span class="thread-sender">{msg.get('sender')}</span>
-                <span class="thread-date">{msg.get('date')}</span>
-                <div class="thread-body">{msg.get('content')}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+            '<div class="status-info">👈 Pick a thread in the sidebar '
+            '(sample or paste your own JSON) and click <b>Generate Draft</b>.</div>',
+            unsafe_allow_html=True,
         )
 
-# --- Right Column: Draft & Actions ---
-with col2:
-    st.subheader("🤖 Generated Draft")
-    
-    if st.session_state.current_draft is None:
-        st.info("No draft generated yet. Click **'Generate Draft'** in the sidebar to begin.")
+with right_col:
+    st.markdown("#### ✍️ AI draft reply")
+
+    draft = st.session_state.current_draft
+    meta = st.session_state.draft_meta
+    status = st.session_state.status
+
+    if not draft:
+        st.markdown(
+            '<div class="status-info">No draft yet. Pick a thread and click '
+            '<b>Generate Draft</b> in the sidebar.</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        # Show generation details
-        st.markdown(f"*Generation Count for this thread:* `{st.session_state.generation_count}`")
-        
-        # Display draft based on current status
-        if st.session_state.status == "approved":
-            st.markdown('<div class="status-approved">✅ Draft Approved! Ready to send.</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="draft-container">{st.session_state.current_draft}</div>', unsafe_allow_html=True)
-            
-        elif st.session_state.status == "rejected":
-            st.markdown('<div class="status-rejected">❌ Draft Rejected. Feel free to regenerate or edit.</div>', unsafe_allow_html=True)
-            st.markdown(f'<div style="opacity: 0.5;" class="draft-container">{st.session_state.current_draft}</div>', unsafe_allow_html=True)
-            
-        elif st.session_state.status == "editing":
-            st.markdown("📝 **Editing Draft**")
-            # Set text area with the draft text or previously edited text
-            edited_text = st.text_area(
-                "Modify reply text:",
-                value=st.session_state.edited_draft_text or st.session_state.current_draft,
-                height=250
+        # Show the draft text (read-only display).
+        st.markdown(render_draft_html(draft, meta), unsafe_allow_html=True)
+
+        # ---------------- Status banner ----------------
+        if status == "approved":
+            st.markdown(
+                '<div class="status-approved">✅ APPROVED &middot; This draft is '
+                'ready to send. Saved to approved_drafts.json.</div>',
+                unsafe_allow_html=True,
             )
-            st.session_state.edited_draft_text = edited_text
-            
-            # Sub-approve button specifically for edited text
-            if st.button("Save & Approve Edited Version", type="primary"):
-                st.session_state.current_draft = edited_text
-                st.session_state.status = "approved"
-                
-                # Save approved draft to approved_drafts.json
-                approved_item = {
-                    "thread_id": current_thread.get("thread_id", "unknown"),
-                    "subject": current_thread.get("subject", ""),
-                    "sender": current_thread.get("sender", ""),
-                    "draft": edited_text,
-                    "approved_at": datetime.now().isoformat(),
-                    "edited": True
-                }
-                
-                # File save handling
+        elif status == "rejected":
+            st.markdown(
+                '<div class="status-rejected">❌ REJECTED &middot; This draft was '
+                'discarded. Click <b>Generate Draft</b> in the sidebar to try again.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        elif status == "editing":
+            st.markdown(
+                '<div class="status-editing">✏️ EDITING &middot; Modify the draft '
+                'below, then click <b>Approve edited version</b>.</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ---------------- Action buttons ----------------
+        st.markdown("---")
+        st.markdown("##### Actions")
+
+        if status != "editing":
+            # Read-only mode: show the three primary actions.
+            btn_cols = st.columns([1, 1, 1])
+            with btn_cols[0]:
+                approve_clicked = st.button(
+                    "✅ APPROVE",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(status == "approved"),
+                )
+            with btn_cols[1]:
+                edit_clicked = st.button(
+                    "✏️ EDIT",
+                    use_container_width=True,
+                )
+            with btn_cols[2]:
+                reject_clicked = st.button(
+                    "❌ REJECT",
+                    use_container_width=True,
+                )
+
+            # ---- Handle APPROVE ----
+            if approve_clicked and status != "approved":
                 try:
-                    if os.path.exists("approved_drafts.json"):
-                        with open("approved_drafts.json", "r", encoding="utf-8") as f:
-                            approved_list = json.load(f)
-                    else:
-                        approved_list = []
-                    
-                    approved_list.append(approved_item)
-                    
-                    with open("approved_drafts.json", "w", encoding="utf-8") as f:
-                        json.dump(approved_list, f, indent=4)
-                except Exception as e:
-                    st.error(f"Error saving to approved_drafts.json: {e}")
-                
-                st.rerun()
-                
-            if st.button("Cancel Editing"):
-                st.session_state.status = "none"
-                st.session_state.edited_draft_text = ""
-                st.rerun()
-                
-        else:
-            # Normal 'none' status - show draft + the three action buttons
-            st.markdown(f'<div class="draft-container">{st.session_state.current_draft}</div>', unsafe_allow_html=True)
-            
-            btn_col1, btn_col2, btn_col3 = st.columns(3)
-            
-            # APPROVE action
-            with btn_col1:
-                if st.button("👍 APPROVE", use_container_width=True, type="primary"):
+                    save_approved_draft(
+                        draft=draft,
+                        thread=st.session_state.draft_thread,
+                        meta=meta,
+                        source="ai",
+                    )
                     st.session_state.status = "approved"
-                    
-                    approved_item = {
-                        "thread_id": current_thread.get("thread_id", "unknown"),
-                        "subject": current_thread.get("subject", ""),
-                        "sender": current_thread.get("sender", ""),
-                        "draft": st.session_state.current_draft,
-                        "approved_at": datetime.now().isoformat(),
-                        "edited": False
-                    }
-                    
+                    st.session_state.edit_buffer = draft
+                    st.success(
+                        f"✅ Approved & saved to {APPROVED_DRAFTS_PATH.name}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"❌ Failed to save approved draft: {e}")
+
+            # ---- Handle EDIT ----
+            if edit_clicked:
+                st.session_state.status = "editing"
+                # Make sure the text area starts with the latest draft body.
+                st.session_state.edit_buffer = draft
+
+            # ---- Handle REJECT ----
+            if reject_clicked:
+                st.session_state.status = "rejected"
+                st.warning("Draft rejected. Regenerate to try again.")
+
+        else:
+            # Editing mode: show the text area + approve-edited button.
+            edited_text = st.text_area(
+                "Edit the draft",
+                value=st.session_state.edit_buffer or draft,
+                height=320,
+                key="edit_text_area",
+            )
+            # Keep the buffer in sync so it persists across reruns.
+            st.session_state.edit_buffer = edited_text
+
+            edit_btn_cols = st.columns([1, 1, 1])
+            with edit_btn_cols[0]:
+                approve_edited_clicked = st.button(
+                    "✅ Approve edited version",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with edit_btn_cols[1]:
+                revert_clicked = st.button(
+                    "↩️ Revert to AI draft",
+                    use_container_width=True,
+                )
+            with edit_btn_cols[2]:
+                cancel_clicked = st.button(
+                    "✖️ Cancel edit",
+                    use_container_width=True,
+                )
+
+            if approve_edited_clicked:
+                final_text = (edited_text or "").strip()
+                if not final_text:
+                    st.error("Edited draft is empty - add some text first.")
+                else:
                     try:
-                        if os.path.exists("approved_drafts.json"):
-                            with open("approved_drafts.json", "r", encoding="utf-8") as f:
-                                approved_list = json.load(f)
-                        else:
-                            approved_list = []
-                        
-                        approved_list.append(approved_item)
-                        
-                        with open("approved_drafts.json", "w", encoding="utf-8") as f:
-                            json.dump(approved_list, f, indent=4)
-                    except Exception as e:
-                        st.error(f"Error saving to approved_drafts.json: {e}")
-                    
-                    st.rerun()
-                    
-            # EDIT action
-            with btn_col2:
-                if st.button("📝 EDIT", use_container_width=True):
-                    st.session_state.status = "editing"
-                    st.session_state.edited_draft_text = st.session_state.current_draft
-                    st.rerun()
-                    
-            # REJECT action
-            with btn_col3:
-                if st.button("👎 REJECT", use_container_width=True):
-                    st.session_state.status = "rejected"
-                    st.rerun()
+                        save_approved_draft(
+                            draft=final_text,
+                            thread=st.session_state.draft_thread,
+                            meta=meta,
+                            source="edited",
+                        )
+                        # Update the displayed draft to the edited version
+                        # and mark as approved.
+                        st.session_state.current_draft = final_text
+                        if st.session_state.draft_meta:
+                            st.session_state.draft_meta["char_count"] = len(final_text)
+                        st.session_state.status = "approved"
+                        st.success(
+                            f"✅ Edited version approved & saved to "
+                            f"{APPROVED_DRAFTS_PATH.name}"
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"❌ Failed to save edited draft: {e}")
+
+            if revert_clicked:
+                st.session_state.edit_buffer = draft
+                st.info("Reverted to the original AI draft text.")
+
+            if cancel_clicked:
+                st.session_state.status = "none"
+                st.session_state.edit_buffer = draft
+                st.info("Edit cancelled. Draft returned to read-only view.")
+
+
+# ---------------------------------------------------------------------------
+# Footer - quick help
+# ---------------------------------------------------------------------------
+
+st.markdown("---")
+with st.expander("ℹ️ How this gate works", expanded=False):
+    st.markdown(
+        """
+**The safety contract**
+
+1. The AI (`draft_machine.py` + Gemini) generates a draft reply.
+2. **Nothing is ever sent automatically.** You must explicitly click `APPROVE`.
+3. You can `EDIT` the draft first - your edited version (not the AI's) is
+   what gets saved.
+4. You can `REJECT` a draft and ask for a new one - rejected drafts are
+   discarded (not saved).
+5. `APPROVE` writes the draft to `approved_drafts.json` with a timestamp.
+   That file is the queue your downstream "send" step (if any) should
+   consume from - and it should still be a *human-triggered* step.
+
+**Session state**
+
+- `current_draft`     - the text on screen
+- `draft_meta`        - model / recipient / length metadata
+- `status`            - `none` | `approved` | `editing` | `rejected`
+- `generation_count`  - how many drafts this session has produced
+- `edit_buffer`       - working text inside the EDIT text area
+
+**Run**
+
+```bash
+streamlit run approval_gate.py
+```
+        """
+    )
